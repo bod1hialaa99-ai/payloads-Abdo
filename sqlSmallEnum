@@ -1,0 +1,57 @@
+-- 1. Current login & user context
+SELECT SUSER_NAME() AS CurrentLogin, 
+       SUSER_SID() AS LoginSID, 
+       USER_NAME() AS CurrentUser, 
+       ORIGINAL_LOGIN() AS OriginalLogin;
+
+-- 2. Server-level roles
+SELECT spr.name AS ServerRole
+FROM sys.server_role_members srm
+JOIN sys.server_principals sp ON srm.member_principal_id = sp.principal_id
+JOIN sys.server_principals spr ON srm.role_principal_id = spr.principal_id
+WHERE sp.name = SUSER_NAME();
+
+-- 3. Explicit server-level permissions
+SELECT perm.state_desc, perm.permission_name, sp.name AS Grantee
+FROM sys.server_permissions perm
+JOIN sys.server_principals sp ON perm.grantee_principal_id = sp.principal_id
+WHERE sp.name = SUSER_NAME();
+
+-- 4. Databases you can see & their owners
+SELECT name AS DatabaseName, 
+       suser_sname(owner_sid) AS OwnerName
+FROM sys.databases;
+
+-- 5. Database roles & memberships (for each DB)
+EXEC sp_msforeachdb '
+USE [?];
+SELECT DB_NAME() AS DatabaseName, 
+       dp.name AS DatabaseUser, 
+       dp.type_desc, 
+       drp.name AS DatabaseRole
+FROM sys.database_role_members drm
+JOIN sys.database_principals dp ON drm.member_principal_id = dp.principal_id
+JOIN sys.database_principals drp ON drm.role_principal_id = drp.principal_id
+WHERE dp.name = USER_NAME();';
+
+-- 6. Explicit DB permissions (for your user)
+EXEC sp_msforeachdb '
+USE [?];
+SELECT DB_NAME() AS DatabaseName,
+       prin.name AS DBUser,
+       perm.permission_name,
+       perm.state_desc,
+       obj.name AS ObjectName,
+       obj.type_desc
+FROM sys.database_permissions perm
+LEFT JOIN sys.objects obj ON perm.major_id = obj.object_id
+JOIN sys.database_principals prin ON perm.grantee_principal_id = prin.principal_id
+WHERE prin.name = USER_NAME();';
+
+-- 7. Any orphaned users (users without matching login)
+EXEC sp_msforeachdb '
+USE [?];
+SELECT DB_NAME() AS DatabaseName, dp.name AS OrphanedUser
+FROM sys.database_principals dp
+LEFT JOIN sys.server_principals sp ON dp.sid = sp.sid
+WHERE sp.sid IS NULL AND dp.type IN (''S'',''U'') AND dp.principal_id > 4;';
