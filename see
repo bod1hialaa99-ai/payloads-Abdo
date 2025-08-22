@@ -17,3 +17,16 @@ JOIN msdb.dbo.backupmediafamily mf
     ON b.media_set_id = mf.media_set_id
 WHERE b.database_name = 'admin'
 ORDER BY b.backup_finish_date DESC;
+
+
+
+
+SELECT TOP 50
+    b.database_name,
+    b.backup_start_date,
+    b.type AS backup_type,
+    mf.physical_device_name
+FROM msdb.dbo.backupset b
+LEFT JOIN msdb.dbo.backupmediafamily mf 
+    ON b.media_set_id = mf.media_set_id
+ORDER BY b.backup_start_date DESC;
