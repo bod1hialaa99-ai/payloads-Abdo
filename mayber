@@ -1,6 +1,6 @@
 -- ===================================================================
--- Quick pentest checks for database 'admin' (read-only, non-destructive)
--- Paste into SSMS and run. Sections will skip when not permitted.
+-- Quick pentest checks for database 'admin' (fixed: no .replace(), no JS)
+-- Paste into SSMS and run. Sections skip when not permitted.
 -- ===================================================================
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
@@ -33,8 +33,8 @@ END CATCH;
 
 -- 3) Try to USE the DB and enumerate metadata (permissions, top tables)
 BEGIN TRY
-    EXEC('
-    BEGIN TRY
+    EXEC(
+    N'BEGIN TRY
         USE [admin];
         SELECT DB_NAME() AS current_db, USER_NAME() AS current_user;
         -- What I can do at the DB scope
@@ -47,20 +47,18 @@ BEGIN TRY
     END TRY
     BEGIN CATCH
         SELECT ''ERROR_IN_DB'' AS section, ERROR_MESSAGE() AS msg;
-    END CATCH
-    ');
+    END CATCH' );
 END TRY BEGIN CATCH
     PRINT 'USE admin metadata attempt: skipped - ' + ERROR_MESSAGE();
 END CATCH;
 
--- 4) If you want to test reading actual data: pick one table from the list above and run:
--- Example: SELECT TOP(5) * FROM [admin].[schema_name].[table_name];
--- (Run manually after you see table names. Do NOT run if you lack explicit approval.)
+-- 4) (Manual) If you see a table name you can try:
+-- SELECT TOP(5) * FROM [admin].[schema_name].[table_name];
 
--- 5) Check guest account permissions inside admin (is guest enabled / what can it do)
+-- 5) Check guest account permissions inside admin
 BEGIN TRY
-    EXEC('
-    BEGIN TRY
+    EXEC(
+    N'BEGIN TRY
         USE [admin];
         SELECT DB_NAME() AS db, dp.name AS principal, perm.permission_name, perm.state_desc
         FROM sys.database_principals dp
@@ -69,8 +67,7 @@ BEGIN TRY
     END TRY
     BEGIN CATCH
         SELECT ''ERROR_GUEST'' AS section, ERROR_MESSAGE() AS msg;
-    END CATCH
-    ');
+    END CATCH' );
 END TRY BEGIN CATCH
     PRINT 'Guest check skipped - ' + ERROR_MESSAGE();
 END CATCH;
@@ -91,6 +88,7 @@ BEGIN TRY
         LEFT JOIN dbo.backupmediafamily bm ON bs.media_set_id = bm.media_set_id
         WHERE bs.database_name = 'admin'
         ORDER BY bs.backup_finish_date DESC;
+        USE master;
     END
     ELSE
         PRINT 'msdb not available';
@@ -98,7 +96,7 @@ END TRY BEGIN CATCH
     PRINT 'backup history: skipped - ' + ERROR_MESSAGE();
 END CATCH;
 
--- 7) If physical_device_name is NULL, show backupset metadata & LSN chain (can indicate if there is usable chain)
+-- 7) If physical_device_name NULL, show backupset metadata & LSN chain
 BEGIN TRY
     IF DB_ID('msdb') IS NOT NULL
     BEGIN
@@ -108,12 +106,13 @@ BEGIN TRY
         FROM dbo.backupset
         WHERE database_name = 'admin'
         ORDER BY backup_finish_date DESC;
+        USE master;
     END
 END TRY BEGIN CATCH
     PRINT 'backup LSN scan skipped - ' + ERROR_MESSAGE();
 END CATCH;
 
--- 8) Can I restore? (Do I have server-level restore / dbcreator perms)
+-- 8) Restore permission checks
 BEGIN TRY
     SELECT permission_check = CASE
         WHEN IS_SRVROLEMEMBER('sysadmin') = 1 THEN 'sysadmin'
@@ -126,7 +125,7 @@ END TRY BEGIN CATCH
     PRINT 'restore-permission checks skipped - ' + ERROR_MESSAGE();
 END CATCH;
 
--- 9) Search for modules / procs (in dbs you can access) that reference admin (possible cross-db / ownership chaining)
+-- 9) Search modules / procs referencing the 'admin' DB (fixed, no JS)
 BEGIN TRY
     DECLARE @dbname sysname;
     DECLARE cur CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
@@ -138,8 +137,7 @@ BEGIN TRY
             DECLARE @sql nvarchar(max) = N'USE ' + QUOTENAME(@dbname) + N';
                 SELECT DB_NAME() AS db, OBJECT_SCHEMA_NAME(object_id) AS schema_name, OBJECT_NAME(object_id) AS object_name, LEFT(definition, 2000) AS snippet
                 FROM sys.sql_modules
-                WHERE definition LIKE ''%[admin].%'' OR definition LIKE ''%USE [admin]%'' OR definition LIKE ''%'''.replace('''','''') + N'%admin%''';
-            -- fallback: run simple pattern search (if permitted)
+                WHERE definition LIKE ''%[admin].%'' OR definition LIKE ''%USE [admin]%'' OR definition LIKE ''%admin.%'';';
             EXEC sp_executesql @sql;
         END TRY BEGIN CATCH
             PRINT 'module-scan skipped for ' + @dbname + ' - ' + ERROR_MESSAGE();
@@ -151,7 +149,7 @@ END TRY BEGIN CATCH
     PRINT 'module search skipped - ' + ERROR_MESSAGE();
 END CATCH;
 
--- 10) Server-level impersonation grants (who can impersonate whom)
+-- 10) Server-level impersonation grants
 BEGIN TRY
     SELECT pr_grantee.name AS grantee, pe.state_desc, pe.permission_name, pr_target.name AS target_login
     FROM sys.server_permissions pe
