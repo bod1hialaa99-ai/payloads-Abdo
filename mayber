@@ -1,0 +1,166 @@
+-- ===================================================================
+-- Quick pentest checks for database 'admin' (read-only, non-destructive)
+-- Paste into SSMS and run. Sections will skip when not permitted.
+-- ===================================================================
+SET NOCOUNT ON;
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+
+PRINT '=== START CHECK: ' + CONVERT(varchar(19), SYSDATETIME(), 120) + ' ===';
+
+-- 0) Basic identity
+BEGIN TRY
+    SELECT CurrentLogin = SUSER_NAME(), CurrentSID = SUSER_SID(), MappedUser = USER_NAME(), OriginalLogin = ORIGINAL_LOGIN();
+END TRY BEGIN CATCH
+    PRINT 'Identity: skipped - ' + ERROR_MESSAGE();
+END CATCH;
+
+-- 1) Does DB "admin" exist & its state + owner
+BEGIN TRY
+    SELECT database_id, name, state_desc, is_read_only, is_encrypted, recovery_model_desc, create_date,
+           owner = SUSER_SNAME(owner_sid)
+    FROM sys.databases
+    WHERE name = 'admin';
+END TRY BEGIN CATCH
+    PRINT 'DB existence check: skipped - ' + ERROR_MESSAGE();
+END CATCH;
+
+-- 2) Can I access the DB (HAS_DBACCESS)
+BEGIN TRY
+    SELECT DB = 'admin', has_dbaccess = HAS_DBACCESS('admin');
+END TRY BEGIN CATCH
+    PRINT 'HAS_DBACCESS: skipped - ' + ERROR_MESSAGE();
+END CATCH;
+
+-- 3) Try to USE the DB and enumerate metadata (permissions, top tables)
+BEGIN TRY
+    EXEC('
+    BEGIN TRY
+        USE [admin];
+        SELECT DB_NAME() AS current_db, USER_NAME() AS current_user;
+        -- What I can do at the DB scope
+        SELECT ''DATABASE_PERMISSIONS'' AS section, * FROM fn_my_permissions(NULL, ''DATABASE'');
+        -- List up to first 50 base tables
+        SELECT TOP(50) TABLE_SCHEMA, TABLE_NAME
+        FROM INFORMATION_SCHEMA.TABLES
+        WHERE TABLE_TYPE = ''BASE TABLE''
+        ORDER BY TABLE_SCHEMA, TABLE_NAME;
+    END TRY
+    BEGIN CATCH
+        SELECT ''ERROR_IN_DB'' AS section, ERROR_MESSAGE() AS msg;
+    END CATCH
+    ');
+END TRY BEGIN CATCH
+    PRINT 'USE admin metadata attempt: skipped - ' + ERROR_MESSAGE();
+END CATCH;
+
+-- 4) If you want to test reading actual data: pick one table from the list above and run:
+-- Example: SELECT TOP(5) * FROM [admin].[schema_name].[table_name];
+-- (Run manually after you see table names. Do NOT run if you lack explicit approval.)
+
+-- 5) Check guest account permissions inside admin (is guest enabled / what can it do)
+BEGIN TRY
+    EXEC('
+    BEGIN TRY
+        USE [admin];
+        SELECT DB_NAME() AS db, dp.name AS principal, perm.permission_name, perm.state_desc
+        FROM sys.database_principals dp
+        LEFT JOIN sys.database_permissions perm ON dp.principal_id = perm.grantee_principal_id
+        WHERE dp.name = ''guest'';
+    END TRY
+    BEGIN CATCH
+        SELECT ''ERROR_GUEST'' AS section, ERROR_MESSAGE() AS msg;
+    END CATCH
+    ');
+END TRY BEGIN CATCH
+    PRINT 'Guest check skipped - ' + ERROR_MESSAGE();
+END CATCH;
+
+-- 6) Backup history for 'admin' (msdb)
+BEGIN TRY
+    IF DB_ID('msdb') IS NOT NULL
+    BEGIN
+        USE msdb;
+        SELECT
+            bs.backup_set_id, bs.database_name, bs.type AS backup_type_code,
+            CASE bs.type WHEN 'D' THEN 'Full' WHEN 'I' THEN 'Differential' WHEN 'L' THEN 'Log' ELSE bs.type END AS backup_type,
+            bs.backup_start_date, bs.backup_finish_date,
+            bs.first_lsn, bs.last_lsn, bs.checkpoint_lsn, bs.database_backup_lsn,
+            bs.backup_size/1024.0/1024.0 AS backup_size_MB,
+            bm.physical_device_name
+        FROM dbo.backupset bs
+        LEFT JOIN dbo.backupmediafamily bm ON bs.media_set_id = bm.media_set_id
+        WHERE bs.database_name = 'admin'
+        ORDER BY bs.backup_finish_date DESC;
+    END
+    ELSE
+        PRINT 'msdb not available';
+END TRY BEGIN CATCH
+    PRINT 'backup history: skipped - ' + ERROR_MESSAGE();
+END CATCH;
+
+-- 7) If physical_device_name is NULL, show backupset metadata & LSN chain (can indicate if there is usable chain)
+BEGIN TRY
+    IF DB_ID('msdb') IS NOT NULL
+    BEGIN
+        USE msdb;
+        SELECT backup_set_id, database_name, type, backup_start_date, backup_finish_date,
+               first_lsn, last_lsn, database_backup_lsn, checkpoint_lsn
+        FROM dbo.backupset
+        WHERE database_name = 'admin'
+        ORDER BY backup_finish_date DESC;
+    END
+END TRY BEGIN CATCH
+    PRINT 'backup LSN scan skipped - ' + ERROR_MESSAGE();
+END CATCH;
+
+-- 8) Can I restore? (Do I have server-level restore / dbcreator perms)
+BEGIN TRY
+    SELECT permission_check = CASE
+        WHEN IS_SRVROLEMEMBER('sysadmin') = 1 THEN 'sysadmin'
+        WHEN IS_SRVROLEMEMBER('serveradmin') = 1 THEN 'serveradmin'
+        WHEN HAS_PERMS_BY_NAME(NULL, 'SERVER', 'ALTER ANY DATABASE') = 1 THEN 'ALTER ANY DATABASE'
+        ELSE 'no obvious server restore perms'
+    END;
+    SELECT * FROM fn_my_permissions(NULL,'SERVER') WHERE permission_name LIKE '%RESTORE%' OR permission_name LIKE '%ALTER%';
+END TRY BEGIN CATCH
+    PRINT 'restore-permission checks skipped - ' + ERROR_MESSAGE();
+END CATCH;
+
+-- 9) Search for modules / procs (in dbs you can access) that reference admin (possible cross-db / ownership chaining)
+BEGIN TRY
+    DECLARE @dbname sysname;
+    DECLARE cur CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
+    OPEN cur;
+    FETCH NEXT FROM cur INTO @dbname;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        BEGIN TRY
+            DECLARE @sql nvarchar(max) = N'USE ' + QUOTENAME(@dbname) + N';
+                SELECT DB_NAME() AS db, OBJECT_SCHEMA_NAME(object_id) AS schema_name, OBJECT_NAME(object_id) AS object_name, LEFT(definition, 2000) AS snippet
+                FROM sys.sql_modules
+                WHERE definition LIKE ''%[admin].%'' OR definition LIKE ''%USE [admin]%'' OR definition LIKE ''%'''.replace('''','''') + N'%admin%''';
+            -- fallback: run simple pattern search (if permitted)
+            EXEC sp_executesql @sql;
+        END TRY BEGIN CATCH
+            PRINT 'module-scan skipped for ' + @dbname + ' - ' + ERROR_MESSAGE();
+        END CATCH;
+        FETCH NEXT FROM cur INTO @dbname;
+    END
+    CLOSE cur; DEALLOCATE cur;
+END TRY BEGIN CATCH
+    PRINT 'module search skipped - ' + ERROR_MESSAGE();
+END CATCH;
+
+-- 10) Server-level impersonation grants (who can impersonate whom)
+BEGIN TRY
+    SELECT pr_grantee.name AS grantee, pe.state_desc, pe.permission_name, pr_target.name AS target_login
+    FROM sys.server_permissions pe
+    JOIN sys.server_principals pr_grantee ON pe.grantee_principal_id = pr_grantee.principal_id
+    LEFT JOIN sys.server_principals pr_target ON pe.major_id = pr_target.principal_id
+    WHERE pe.permission_name = 'IMPERSONATE'
+    ORDER BY pr_grantee.name, pr_target.name;
+END TRY BEGIN CATCH
+    PRINT 'server impersonation scan: skipped - ' + ERROR_MESSAGE();
+END CATCH;
+
+PRINT '=== END CHECK: ' + CONVERT(varchar(19), SYSDATETIME(), 120) + ' ===';
