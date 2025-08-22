@@ -1,7 +1,7 @@
 /* ================================================================
-   FULL PENTEST ENUMERATION (READ-ONLY) -- Paste into SSMS / GUI
-   Non-destructive. Uses TRY/CATCH to skip inaccessible items.
-   Purpose: collect everything a pentester needs to triage DB attack surface.
+   FIXED: Full Pentest Enumeration Script (SSMS / GUI friendly)
+   Read-only. Avoids previous QUOTENAME quoting errors.
+   Paste and run in SSMS as one batch.
    ================================================================ */
 
 SET NOCOUNT ON;
@@ -23,23 +23,22 @@ BEGIN TRY
         SystemUser        = SYSTEM_USER,
         ServerName        = @@SERVERNAME,
         Version           = @@VERSION,
-        EngineEdition     = CAST(SERVERPROPERTY('EngineEdition') AS sql_variant),
-        Edition           = CAST(SERVERPROPERTY('Edition') AS sql_variant),
-        ProductLevel      = CAST(SERVERPROPERTY('ProductLevel') AS sql_variant),
-        Collation         = CAST(SERVERPROPERTY('Collation') AS sql_variant),
-        IsClustered       = CAST(SERVERPROPERTY('IsClustered') AS sql_variant);
+        EngineEdition     = TRY_CAST(SERVERPROPERTY('EngineEdition') AS sql_variant),
+        Edition           = TRY_CAST(SERVERPROPERTY('Edition') AS sql_variant),
+        ProductLevel      = TRY_CAST(SERVERPROPERTY('ProductLevel') AS sql_variant),
+        Collation         = TRY_CAST(SERVERPROPERTY('Collation') AS sql_variant),
+        IsClustered       = TRY_CAST(SERVERPROPERTY('IsClustered') AS sql_variant);
 END TRY
 BEGIN CATCH
     PRINT 'Context Info: skipped due to: ' + ERROR_MESSAGE();
 END CATCH;
-
 
 /* ---------------------------
    SERVER PRINCIPALS & ROLES
    --------------------------- */
 PRINT '--- SERVER PRINCIPALS / ROLES ---';
 BEGIN TRY
-    SELECT name, principal_id, type, type_desc, is_fixed_role, is_disabled, create_date, modify_date
+    SELECT name, principal_id, type, type_desc, is_fixed_role, is_disabled, default_database_name, create_date, modify_date
     FROM sys.server_principals
     ORDER BY type_desc, name;
 END TRY BEGIN CATCH
@@ -56,9 +55,9 @@ END TRY BEGIN CATCH
     PRINT 'server_role_members: skipped - ' + ERROR_MESSAGE();
 END CATCH;
 
-/* Check server roles membership for current login */
+/* current login's server roles (if any) */
 BEGIN TRY
-    SELECT SUSER_NAME() AS current_login, r.name AS server_role
+    SELECT DISTINCT r.name AS my_server_role
     FROM sys.server_role_members srm
     JOIN sys.server_principals r ON srm.role_principal_id = r.principal_id
     JOIN sys.server_principals m ON srm.member_principal_id = m.principal_id
@@ -109,7 +108,7 @@ END TRY BEGIN CATCH
     PRINT 'sys.configurations: skipped - ' + ERROR_MESSAGE();
 END CATCH;
 
-/* Endpoints (network surfaces) */
+/* Endpoints */
 PRINT '--- ENDPOINTS ---';
 BEGIN TRY
     SELECT name, type_desc, protocol_desc, state_desc, is_admin_endpoint
@@ -143,7 +142,6 @@ END TRY BEGIN CATCH
     PRINT 'sys.databases: skipped - ' + ERROR_MESSAGE();
 END CATCH;
 
-/* Database snapshot check */
 PRINT '--- DATABASE SNAPSHOTS ---';
 BEGIN TRY
     SELECT name AS snapshot_name, database_id, source_database_id, create_date
@@ -177,7 +175,8 @@ BEGIN TRY
         JOIN dbo.sysjobs j ON h.job_id = j.job_id
         ORDER BY h.instance_id DESC;
 
-        SELECT proxy_id, name AS proxy_name, credential_id, credential_name = ISNULL((SELECT name FROM master.sys.credentials c WHERE c.credential_id = p.credential_id), '(n/a)')
+        SELECT proxy_id, name AS proxy_name, credential_id,
+               ISNULL((SELECT name FROM master.sys.credentials c WHERE c.credential_id = p.credential_id), '(n/a)') AS credential_name
         FROM dbo.sysproxies p;
         
         SELECT name, email_address, enabled FROM dbo.sysoperators;
@@ -211,50 +210,30 @@ END TRY BEGIN CATCH
     PRINT 'backup history skipped - ' + ERROR_MESSAGE();
 END CATCH;
 
-/* Restore history (if present) */
-PRINT '--- RESTORE HISTORY (msdb.restorehistory) ---';
-BEGIN TRY
-    IF DB_ID('msdb') IS NOT NULL AND OBJECT_ID('msdb.dbo.restorehistory') IS NOT NULL
-    BEGIN
-        USE msdb;
-        SELECT TOP(200) * FROM dbo.restorehistory ORDER BY restore_date DESC;
-        USE master;
-    END
-END TRY BEGIN CATCH
-    PRINT 'restore history skipped - ' + ERROR_MESSAGE();
-END CATCH;
-
 /* ---------------------------
-   CREDENTIALS / DATABASE-SCOPED CREDENTIALS / EXTERNAL DATA SOURCES
+   DB-SCOPED CREDENTIALS / EXTERNAL DATA SOURCES
    --------------------------- */
-PRINT '--- CREDENTIALS & DB-SCOPED CREDENTIALS / EXTERNAL DATA SOURCES ---';
+PRINT '--- DB-SCOPED CREDENTIALS / EXTERNAL DATA SOURCES (per DB) ---';
 BEGIN TRY
-    SELECT credential_id, name, credential_identity = principal_id, create_date FROM sys.credentials;
-END TRY BEGIN CATCH
-    PRINT 'sys.credentials skipped - ' + ERROR_MESSAGE();
-END CATCH;
-
-BEGIN TRY
-    DECLARE @dbname sysname;
-    DECLARE dbc CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
-    OPEN dbc;
-    FETCH NEXT FROM dbc INTO @dbname;
+    DECLARE @db_for_creds sysname;
+    DECLARE cur_creds CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
+    OPEN cur_creds;
+    FETCH NEXT FROM cur_creds INTO @db_for_creds;
     WHILE @@FETCH_STATUS = 0
     BEGIN
         BEGIN TRY
-            DECLARE @sql nvarchar(max) = N'USE ' + QUOTENAME(@dbname) + N';
+            DECLARE @sql_creds nvarchar(max) = N'USE ' + QUOTENAME(@db_for_creds) + N';
                 IF OBJECT_ID(''sys.database_scoped_credentials'') IS NOT NULL
-                    SELECT DB_NAME() AS db, name, credential_identity, create_date FROM sys.database_scoped_credentials;
+                    SELECT DB_NAME() AS database_name, name AS scoped_credential, credential_identity, create_date FROM sys.database_scoped_credentials;
                 IF OBJECT_ID(''sys.external_data_sources'') IS NOT NULL
-                    SELECT DB_NAME() AS db, name, type, location, pushdown FROM sys.external_data_sources;';
-            EXEC sp_executesql @sql;
+                    SELECT DB_NAME() AS database_name, name AS external_data_source, type, location, pushdown FROM sys.external_data_sources;';
+            EXEC sp_executesql @sql_creds;
         END TRY BEGIN CATCH
-            PRINT 'db-scoped creds/external for ' + @dbname + ' skipped - ' + ERROR_MESSAGE();
+            PRINT 'db-scoped creds/external for ' + @db_for_creds + ' skipped - ' + ERROR_MESSAGE();
         END CATCH;
-
-        FETCH NEXT FROM dbc INTO @dbname;
+        FETCH NEXT FROM cur_creds INTO @db_for_creds;
     END
-    CLOSE dbc; DEALLOCATE dbc;
+    CLOSE cur_creds; DEALLOCATE cur_creds;
 END TRY BEGIN CATCH
     PRINT 'db-scoped credential enumeration skipped - ' + ERROR_MESSAGE();
 END CATCH;
@@ -264,39 +243,35 @@ END CATCH;
    --------------------------- */
 PRINT '--- TEMPORAL TABLES / CDC / CHANGE TRACKING ---';
 BEGIN TRY
-    DECLARE @db2 sysname;
-    DECLARE cdc_cur CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
-    OPEN cdc_cur;
-    FETCH NEXT FROM cdc_cur INTO @db2;
+    DECLARE @db_ct sysname;
+    DECLARE cur_ct CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
+    OPEN cur_ct;
+    FETCH NEXT FROM cur_ct INTO @db_ct;
     WHILE @@FETCH_STATUS = 0
     BEGIN
         BEGIN TRY
-            DECLARE @sql2 nvarchar(max) = N'USE ' + QUOTENAME(@db2) + N';
-                -- Temporal tables
+            DECLARE @sql_ct nvarchar(max) = N'USE ' + QUOTENAME(@db_ct) + N';
                 SELECT DB_NAME() AS database_name, s.name AS schema_name, t.name AS table_name, t.temporal_type_desc, h.name AS history_table
                 FROM sys.tables t
                 JOIN sys.schemas s ON t.schema_id = s.schema_id
                 LEFT JOIN sys.tables h ON t.history_table_id = h.object_id
                 WHERE t.temporal_type > 0;
-                -- CDC tracked tables
                 IF OBJECT_ID(''cdc.change_tables'') IS NOT NULL
                 BEGIN
                     SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(ct.object_id) AS schema_name, OBJECT_NAME(ct.object_id) AS tracked_table
                     FROM cdc.change_tables ct;
                 END
-                -- Change tracking DB-level info
                 IF OBJECT_ID(''sys.change_tracking_databases'') IS NOT NULL
                 BEGIN
                     SELECT DB_NAME() AS database_name, retention_period, is_auto_cleanup_on FROM sys.change_tracking_databases WHERE database_id = DB_ID();
                 END';
-            EXEC sp_executesql @sql2;
+            EXEC sp_executesql @sql_ct;
         END TRY BEGIN CATCH
-            PRINT 'Temporal/CDC/CT scan skipped for ' + @db2 + ' - ' + ERROR_MESSAGE();
+            PRINT 'Temporal/CDC/CT scan skipped for ' + @db_ct + ' - ' + ERROR_MESSAGE();
         END CATCH;
-
-        FETCH NEXT FROM cdc_cur INTO @db2;
+        FETCH NEXT FROM cur_ct INTO @db_ct;
     END
-    CLOSE cdc_cur; DEALLOCATE cdc_cur;
+    CLOSE cur_ct; DEALLOCATE cur_ct;
 END TRY BEGIN CATCH
     PRINT 'Temporal/CDC scanning: skipped - ' + ERROR_MESSAGE();
 END CATCH;
@@ -306,37 +281,36 @@ END CATCH;
    --------------------------- */
 PRINT '--- MODULES: EXECUTE AS / xp_cmdshell / sp_OACreate / OPENROWSET patterns ---';
 BEGIN TRY
-    DECLARE @db3 sysname;
-    DECLARE modcur CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
-    OPEN modcur;
-    FETCH NEXT FROM modcur INTO @db3;
+    DECLARE @db_mod sysname;
+    DECLARE cur_mod CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
+    OPEN cur_mod;
+    FETCH NEXT FROM cur_mod INTO @db_mod;
     WHILE @@FETCH_STATUS = 0
     BEGIN
         BEGIN TRY
-            DECLARE @m sql_variant = @db3;
-            DECLARE @sql3 nvarchar(max) = N'USE ' + QUOTENAME(@db3) + N';
+            DECLARE @sql_mod nvarchar(max) = N'USE ' + QUOTENAME(@db_mod) + N';
                 SELECT DB_NAME() AS db, OBJECT_SCHEMA_NAME(object_id) AS schema_name, OBJECT_NAME(object_id) AS object_name, definition
                 FROM sys.sql_modules
-                WHERE definition LIKE ''%EXECUTE AS%'' OR definition LIKE ''%EXECUTE AS OWNER%'' OR definition LIKE ''%EXECUTE AS ''%''
+                WHERE definition LIKE ''%EXECUTE AS%'' OR definition LIKE ''%EXECUTE AS OWNER%'' OR definition LIKE ''%EXECUTE AS '''';
 
                 UNION ALL
 
                 SELECT DB_NAME(), OBJECT_SCHEMA_NAME(object_id), OBJECT_NAME(object_id), definition
                 FROM sys.sql_modules
                 WHERE definition LIKE ''%xp_cmdshell%'' OR definition LIKE ''%sp_OACreate%'' OR definition LIKE ''%OPENROWSET%'' OR definition LIKE ''%OPENDATASOURCE%'' OR definition LIKE ''%xp_regread%'' OR definition LIKE ''%bcp %'';';
-            EXEC sp_executesql @sql3;
+            EXEC sp_executesql @sql_mod;
         END TRY BEGIN CATCH
-            PRINT 'Module scan skipped for ' + @db3 + ' - ' + ERROR_MESSAGE();
+            PRINT 'Module scan skipped for ' + @db_mod + ' - ' + ERROR_MESSAGE();
         END CATCH;
-        FETCH NEXT FROM modcur INTO @db3;
+        FETCH NEXT FROM cur_mod INTO @db_mod;
     END
-    CLOSE modcur; DEALLOCATE modcur;
+    CLOSE cur_mod; DEALLOCATE cur_mod;
 END TRY BEGIN CATCH
     PRINT 'modules enumeration skipped - ' + ERROR_MESSAGE();
 END CATCH;
 
-/* CLR / Assemblies */
-PRINT '--- CLR / Assemblies (DB & Server) ---';
+/* CLR / Assemblies (server + per db) */
+PRINT '--- CLR / ASSEMBLIES (server + per-db) ---';
 BEGIN TRY
     SELECT * FROM sys.assemblies;
 END TRY BEGIN CATCH
@@ -344,78 +318,81 @@ END TRY BEGIN CATCH
 END CATCH;
 
 BEGIN TRY
-    DECLARE @db4 sysname;
-    DECLARE asmcur CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
-    OPEN asmcur;
-    FETCH NEXT FROM asmcur INTO @db4;
+    DECLARE @db_asm sysname;
+    DECLARE cur_asm CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
+    OPEN cur_asm;
+    FETCH NEXT FROM cur_asm INTO @db_asm;
     WHILE @@FETCH_STATUS = 0
     BEGIN
         BEGIN TRY
-            EXEC('USE ' + QUOTENAME(@db4) + '; SELECT DB_NAME() AS db, assembly_id, name, permission_set_desc FROM sys.assemblies;');
+            DECLARE @sql_asm nvarchar(max) = N'USE ' + QUOTENAME(@db_asm) + N'; SELECT DB_NAME() AS database_name, assembly_id, name, permission_set_desc FROM sys.assemblies;';
+            EXEC sp_executesql @sql_asm;
         END TRY BEGIN CATCH
-            PRINT 'assemblies skipped for ' + @db4 + ' - ' + ERROR_MESSAGE();
+            PRINT 'assemblies skipped for ' + @db_asm + ' - ' + ERROR_MESSAGE();
         END CATCH;
-        FETCH NEXT FROM asmcur INTO @db4;
+        FETCH NEXT FROM cur_asm INTO @db_asm;
     END
-    CLOSE asmcur; DEALLOCATE asmcur;
+    CLOSE cur_asm; DEALLOCATE cur_asm;
 END TRY BEGIN CATCH
     PRINT 'assemblies (per-db) skipped - ' + ERROR_MESSAGE();
 END CATCH;
 
 /* ---------------------------
-   OBJECT-LEVEL PERMISSIONS / WHAT YOU CAN DO
+   OBJECT-LEVEL PERMISSIONS / fn_my_permissions
    --------------------------- */
-PRINT '--- OBJECT-LEVEL PERMISSIONS FOR CURRENT USER (fn_my_permissions) ---';
+PRINT '--- FN_MY_PERMISSIONS: SERVER ---';
 BEGIN TRY
-    SELECT 'SERVER' AS scope, * FROM fn_my_permissions(NULL, 'SERVER');
+    SELECT 'SERVER' AS scope_name, * FROM fn_my_permissions(NULL, 'SERVER');
 END TRY BEGIN CATCH
     PRINT 'fn_my_permissions SERVER: skipped - ' + ERROR_MESSAGE();
 END CATCH;
 
+PRINT '--- FN_MY_PERMISSIONS: PER DATABASE ---';
 BEGIN TRY
-    DECLARE @db5 sysname;
-    DECLARE permcur CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
-    OPEN permcur;
-    FETCH NEXT FROM permcur INTO @db5;
+    DECLARE @db_perm sysname;
+    DECLARE cur_perm CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
+    OPEN cur_perm;
+    FETCH NEXT FROM cur_perm INTO @db_perm;
     WHILE @@FETCH_STATUS = 0
     BEGIN
         BEGIN TRY
-            EXEC('USE ' + QUOTENAME(@db5) + ';
-                  SELECT DB_NAME() AS database_name, * FROM fn_my_permissions(NULL, ''DATABASE'');');
+            DECLARE @sql_perm nvarchar(max) = N'USE ' + QUOTENAME(@db_perm) + N'; SELECT DB_NAME() AS database_name, * FROM fn_my_permissions(NULL, ''DATABASE'');';
+            EXEC sp_executesql @sql_perm;
         END TRY BEGIN CATCH
-            PRINT 'fn_my_permissions skipped for ' + @db5 + ' - ' + ERROR_MESSAGE();
+            PRINT 'fn_my_permissions skipped for ' + @db_perm + ' - ' + ERROR_MESSAGE();
         END CATCH;
-
-        FETCH NEXT FROM permcur INTO @db5;
+        FETCH NEXT FROM cur_perm INTO @db_perm;
     END
-    CLOSE permcur; DEALLOCATE permcur;
+    CLOSE cur_perm; DEALLOCATE cur_perm;
 END TRY BEGIN CATCH
-    PRINT 'fn_my_permissions (per-db): skipped - ' + ERROR_MESSAGE();
+    PRINT 'fn_my_permissions (per-db) skipped - ' + ERROR_MESSAGE();
 END CATCH;
 
-/* Explicit grants/denies for your mapped user across DBs */
-PRINT '--- EXPLICIT DB PERMISSIONS FOR CURRENT MAPPED USER ---';
+/* ---------------------------
+   EXPLICIT DB PERMISSIONS FOR YOUR MAPPED USER
+   --------------------------- */
+PRINT '--- EXPLICIT DB PERMISSIONS FOR CURRENT USER (per DB) ---';
 BEGIN TRY
-    DECLARE @db6 sysname;
-    DECLARE perm2 CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
-    OPEN perm2;
-    FETCH NEXT FROM perm2 INTO @db6;
+    DECLARE @db_perm2 sysname;
+    DECLARE cur_perm2 CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
+    OPEN cur_perm2;
+    FETCH NEXT FROM cur_perm2 INTO @db_perm2;
     WHILE @@FETCH_STATUS = 0
     BEGIN
         BEGIN TRY
-            EXEC('USE ' + QUOTENAME(@db6) + ';
+            DECLARE @sql_perm2 nvarchar(max) = N'USE ' + QUOTENAME(@db_perm2) + N';
                 SELECT DB_NAME() AS database_name, prin.name AS db_principal, perm.permission_name, perm.state_desc,
                        OBJECT_SCHEMA_NAME(perm.major_id) AS object_schema, OBJECT_NAME(perm.major_id) AS object_name
                 FROM sys.database_permissions perm
                 JOIN sys.database_principals prin ON perm.grantee_principal_id = prin.principal_id
-                WHERE prin.sid = SUSER_SID() OR prin.name = USER_NAME();');
+                WHERE prin.sid = SUSER_SID() OR prin.name = USER_NAME();';
+            EXEC sp_executesql @sql_perm2;
         END TRY BEGIN CATCH
-            PRINT 'explicit db permissions skipped for ' + @db6 + ' - ' + ERROR_MESSAGE();
+            PRINT 'explicit db permissions skipped for ' + @db_perm2 + ' - ' + ERROR_MESSAGE();
         END CATCH;
-
-        FETCH NEXT FROM perm2 INTO @db6;
+        FETCH NEXT FROM cur_perm2 INTO @db_perm2;
     END
-    CLOSE perm2; DEALLOCATE perm2;
+    CLOSE cur_perm2; DEALLOCATE cur_perm2;
 END TRY BEGIN CATCH
     PRINT 'explicit db perms (loop) skipped - ' + ERROR_MESSAGE();
 END CATCH;
@@ -423,37 +400,37 @@ END CATCH;
 /* ---------------------------
    ORPHANED USERS / USER MAPPINGS
    --------------------------- */
-PRINT '--- ORPHANED USERS & SID MISMATCHES ---';
+PRINT '--- ORPHANED USERS & SID MISMATCHES (per DB) ---';
 BEGIN TRY
-    DECLARE @db7 sysname;
-    DECLARE orphan CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
-    OPEN orphan;
-    FETCH NEXT FROM orphan INTO @db7;
+    DECLARE @db_orph sysname;
+    DECLARE cur_orph CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
+    OPEN cur_orph;
+    FETCH NEXT FROM cur_orph INTO @db_orph;
     WHILE @@FETCH_STATUS = 0
     BEGIN
         BEGIN TRY
-            EXEC('USE ' + QUOTENAME(@db7) + ';
+            DECLARE @sql_orph nvarchar(max) = N'USE ' + QUOTENAME(@db_orph) + N';
                 SELECT DB_NAME() AS database_name, dp.name AS user_name, dp.type_desc, dp.authentication_type_desc, dp.sid,
                        CASE WHEN dp.sid IS NULL THEN ''NULL SID''
                             WHEN dp.sid NOT IN (SELECT sid FROM master.sys.server_principals WHERE sid IS NOT NULL) THEN ''No matching login on server''
                             ELSE NULL END AS note
                 FROM sys.database_principals dp
-                WHERE dp.type IN (''S'',''U'',''G'') AND dp.principal_id > 4;');
+                WHERE dp.type IN (''S'',''U'',''G'') AND dp.principal_id > 4;';
+            EXEC sp_executesql @sql_orph;
         END TRY BEGIN CATCH
-            PRINT 'orphans skipped for ' + @db7 + ' - ' + ERROR_MESSAGE();
+            PRINT 'orphans skipped for ' + @db_orph + ' - ' + ERROR_MESSAGE();
         END CATCH;
-
-        FETCH NEXT FROM orphan INTO @db7;
+        FETCH NEXT FROM cur_orph INTO @db_orph;
     END
-    CLOSE orphan; DEALLOCATE orphan;
+    CLOSE cur_orph; DEALLOCATE cur_orph;
 END TRY BEGIN CATCH
     PRINT 'orphan scanning skipped - ' + ERROR_MESSAGE();
 END CATCH;
 
 /* ---------------------------
-   AUDITING / EXTENDED EVENTS / POLICY-BASED MANAGEMENT
+   AUDITING / EXTENDED EVENTS
    --------------------------- */
-PRINT '--- AUDITS / SERVER & DB AUDIT SPECIFICATIONS / XE SESSIONS ---';
+PRINT '--- AUDITS / EXTENDED EVENTS ---';
 BEGIN TRY
     IF OBJECT_ID('sys.server_audits') IS NOT NULL
         SELECT * FROM sys.server_audits;
@@ -461,39 +438,6 @@ END TRY BEGIN CATCH
     PRINT 'server_audits skipped - ' + ERROR_MESSAGE();
 END CATCH;
 
-BEGIN TRY
-    IF OBJECT_ID('sys.server_audit_specifications') IS NOT NULL
-        SELECT * FROM sys.server_audit_specifications;
-END TRY BEGIN CATCH
-    PRINT 'server_audit_specifications skipped - ' + ERROR_MESSAGE();
-END CATCH;
-
-BEGIN TRY
-    IF OBJECT_ID('sys.database_audit_specifications') IS NOT NULL
-    BEGIN
-        DECLARE @db8 sysname;
-        DECLARE aud CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
-        OPEN aud;
-        FETCH NEXT FROM aud INTO @db8;
-        WHILE @@FETCH_STATUS = 0
-        BEGIN
-            BEGIN TRY
-                EXEC('USE ' + QUOTENAME(@db8) + ';
-                      IF OBJECT_ID(''sys.database_audit_specifications'') IS NOT NULL
-                          SELECT DB_NAME() AS database_name, * FROM sys.database_audit_specifications;');
-            END TRY BEGIN CATCH
-                PRINT 'db audit specs skipped for ' + @db8 + ' - ' + ERROR_MESSAGE();
-            END CATCH;
-
-            FETCH NEXT FROM aud INTO @db8;
-        END
-        CLOSE aud; DEALLOCATE aud;
-    END
-END TRY BEGIN CATCH
-    PRINT 'database audit specification scanning skipped - ' + ERROR_MESSAGE();
-END CATCH;
-
-PRINT '--- EXTENDED EVENTS (server sessions) ---';
 BEGIN TRY
     IF OBJECT_ID('sys.server_event_sessions') IS NOT NULL
         SELECT * FROM sys.server_event_sessions;
@@ -504,9 +448,9 @@ END TRY BEGIN CATCH
 END CATCH;
 
 /* ---------------------------
-   DMVs (informational) -- may require VIEW SERVER STATE
+   DMVs (informational)
    --------------------------- */
-PRINT '--- DMVs (connections, exec requests, open transactions) ---';
+PRINT '--- DMVs: SESSIONS / REQUESTS (may be restricted) ---';
 BEGIN TRY
     IF OBJECT_ID('sys.dm_exec_sessions') IS NOT NULL
     BEGIN
@@ -530,9 +474,9 @@ END TRY BEGIN CATCH
 END CATCH;
 
 /* ---------------------------
-   FILESYSTEM / FILES / FILESTREAM / FILETABLES
+   FILES, FILESTREAM, FILETABLES
    --------------------------- */
-PRINT '--- DATABASE FILES / FILESTREAM / FILETABLES ---';
+PRINT '--- FILES / MASTER_FILES / FILETABLES ---';
 BEGIN TRY
     SELECT DB_NAME(database_id) AS database_name, file_id, name, type_desc, physical_name, size/128.0 AS size_mb, max_size
     FROM sys.master_files
@@ -542,82 +486,56 @@ END TRY BEGIN CATCH
 END CATCH;
 
 BEGIN TRY
-    DECLARE @db9 sysname;
-    DECLARE fs CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
-    OPEN fs;
-    FETCH NEXT FROM fs INTO @db9;
+    DECLARE @db_ft sysname;
+    DECLARE cur_ft CURSOR FAST_FORWARD FOR SELECT name FROM sys.databases WHERE state = 0;
+    OPEN cur_ft;
+    FETCH NEXT FROM cur_ft INTO @db_ft;
     WHILE @@FETCH_STATUS = 0
     BEGIN
         BEGIN TRY
-            EXEC('USE ' + QUOTENAME(@db9) + ';
+            DECLARE @sql_ft nvarchar(max) = N'USE ' + QUOTENAME(@db_ft) + N';
                 IF OBJECT_ID(''sys.filetables'') IS NOT NULL
-                    SELECT DB_NAME() AS database_name, name, object_id FROM sys.filetables;');
+                    SELECT DB_NAME() AS database_name, name, object_id FROM sys.filetables;';
+            EXEC sp_executesql @sql_ft;
         END TRY BEGIN CATCH
-            PRINT 'filetable check skipped for ' + @db9 + ' - ' + ERROR_MESSAGE();
+            PRINT 'filetable check skipped for ' + @db_ft + ' - ' + ERROR_MESSAGE();
         END CATCH;
-        FETCH NEXT FROM fs INTO @db9;
+        FETCH NEXT FROM cur_ft INTO @db_ft;
     END
-    CLOSE fs; DEALLOCATE fs;
+    CLOSE cur_ft; DEALLOCATE cur_ft;
 END TRY BEGIN CATCH
     PRINT 'filetable scanning skipped - ' + ERROR_MESSAGE();
 END CATCH;
 
 /* ---------------------------
-   KEY MATERIAL: CERTIFICATES / KEYS / ASYMMETRIC / SYMMETRIC
+   KEYS / CERTIFICATES
    --------------------------- */
-PRINT '--- CERTIFICATES / KEYS / ASYMMETRIC KEYS ---';
+PRINT '--- CERTIFICATES / KEYS ---';
 BEGIN TRY
-    SELECT * FROM sys.server_certificates;
+    IF OBJECT_ID('sys.server_certificates') IS NOT NULL
+        SELECT * FROM sys.server_certificates;
 END TRY BEGIN CATCH
     PRINT 'server_certificates skipped - ' + ERROR_MESSAGE();
 END CATCH;
 
 BEGIN TRY
-    SELECT * FROM sys.certificates;
+    IF OBJECT_ID('sys.certificates') IS NOT NULL
+        SELECT * FROM sys.certificates;
 END TRY BEGIN CATCH
     PRINT 'certificates (db) skipped - ' + ERROR_MESSAGE();
 END CATCH;
 
-BEGIN TRY
-    SELECT * FROM sys.asymmetric_keys;
-END TRY BEGIN CATCH
-    PRINT 'asymmetric_keys skipped - ' + ERROR_MESSAGE();
-END CATCH;
-
 /* ---------------------------
-   MISC: DATABASE MAIL, POLICY, RESOURCE GOVERNOR
+   FINAL: QUICK SUMMARY
    --------------------------- */
-PRINT '--- DATABASE MAIL / POLICY / RESOURCE GOVERNOR ---';
-BEGIN TRY
-    IF OBJECT_ID('msdb.dbo.sysmail_server') IS NOT NULL
-    BEGIN
-        SELECT name, email_address, account_id FROM msdb.dbo.sysmail_profile;
-        SELECT * FROM msdb.dbo.sysmail_server;
-    END
-END TRY BEGIN CATCH
-    PRINT 'database mail info skipped - ' + ERROR_MESSAGE();
-END CATCH;
-
-BEGIN TRY
-    IF OBJECT_ID('sys.resource_governor_configuration') IS NOT NULL
-        SELECT * FROM sys.resource_governor_configuration;
-END TRY BEGIN CATCH
-    PRINT 'resource governor skipped - ' + ERROR_MESSAGE();
-END CATCH;
-
-/* ---------------------------
-   FINAL: SUMMARY OF FINDINGS / WHAT YOU ARE
-   --------------------------- */
-PRINT '--- QUICK SUMMARY: YOUR MAPPING & ROLES ---';
+PRINT '--- QUICK SUMMARY ---';
 BEGIN TRY
     SELECT
         CurrentLogin = SUSER_NAME(),
         LoginSID = SUSER_SID(),
         LoginID = SUSER_ID(),
         MappedUser = USER_NAME(),
-        DBsYouMapTo = (SELECT STRING_AGG(name, ',') FROM sys.databases d WHERE EXISTS (SELECT 1 FROM sys.database_principals dp WHERE dp.sid = SUSER_SID() AND DB_NAME() = d.name)),
-        IsSysadmin = IS_SRVROLEMEMBER('sysadmin'),
-        IsServerRoleMemberList = (SELECT STRING_AGG(r.name, ',') FROM sys.server_role_members srm JOIN sys.server_principals r ON srm.role_principal_id = r.principal_id JOIN sys.server_principals m ON srm.member_principal_id = m.principal_id WHERE m.name = SUSER_NAME())
+        IsSysadmin = IS_SRVROLEMEMBER('sysadmin');
 END TRY BEGIN CATCH
     PRINT 'quick summary skipped - ' + ERROR_MESSAGE();
 END CATCH;
