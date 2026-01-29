@@ -167,7 +167,7 @@ function Invoke-BloodHoundCollector {
         
         # Convert to JSON and save
         Write-Host "[*] Converting to JSON format..." -ForegroundColor Cyan
-        $jsonData = ConvertTo-Json -InputObject $bloodHoundData -Depth 10 -Compress
+        $jsonData = ConvertTo-Json -InputObject $bloodHoundData -Depth 10
         
         # Save to file
         $jsonData | Out-File -FilePath $OutputPath -Encoding UTF8
@@ -245,6 +245,11 @@ function Format-UserForBloodHound {
         $highValue = $true
     }
     
+    # Check if user is in high-value groups
+    if ($User.MemberOf -match "Domain Admins|Enterprise Admins|Schema Admins|Administrators") {
+        $highValue = $true
+    }
+    
     return @{
         ObjectIdentifier = $User.SID.Value
         Properties = @{
@@ -262,7 +267,13 @@ function Format-UserForBloodHound {
             email = $User.Email
             description = $User.Description
             title = $User.Title
-            haslaps = $false  # Would need additional checks
+            haslaps = $false
+            hasspn = $false
+            dontreqpreauth = $false
+            sensitive = $false
+            passwordnotreqd = if ($User.PasswordNotRequired) { $true } else { $false }
+            pwdneverexpires = if ($User.PasswordNeverExpires) { $true } else { $false }
+            spn = @()
         }
     }
 }
@@ -281,10 +292,15 @@ function Format-ComputerForBloodHound {
         $highValue = $true
     }
     
+    # Check if computer is a domain controller
+    if ($Computer.OperatingSystem -like "*Windows Server*" -and $Computer.Name -like "*DC*") {
+        $highValue = $true
+    }
+    
     return @{
         ObjectIdentifier = $Computer.SID.Value
         Properties = @{
-            name = $Computer.Name
+            name = $Computer.Name.ToUpper()
             distinguishedname = $Computer.DistinguishedName
             domain = $Domain.DNSRoot
             domainsid = $Domain.DomainSID.Value
@@ -297,8 +313,12 @@ function Format-ComputerForBloodHound {
             sidhistory = if ($Computer.SIDHistory) { $Computer.SIDHistory.Value } else { $null }
             admincount = $adminCount
             highvalue = $highValue
-            haslaps = $false  # Would need additional checks
+            haslaps = $false
+            hasspn = $false
+            unconstraineddelegation = $false
+            trustedtoauth = $false
             description = $Computer.Description
+            serviceprincipalnames = @()
         }
     }
 }
@@ -473,24 +493,45 @@ function Get-SessionsForBloodHound {
     return $sessions
 }
 
-function Get-QuickCollection {
-    param(
-        [string]$DomainController,
-        [pscredential]$Credential,
-        [string]$OutputPath = ".\bloodhound_data.json"
-    )
+# Main execution if script is run directly
+if ($MyInvocation.InvocationName -ne '.') {
+    # Parse command line arguments
+    $params = @{}
     
-    Write-Host "[*] Performing quick BloodHound collection..." -ForegroundColor Green
-    
-    $params = @{
-        OutputPath = $OutputPath
+    # Check for output path parameter
+    for ($i = 0; $i -lt $args.Count; $i++) {
+        switch ($args[$i]) {
+            "-OutputPath" {
+                if ($i + 1 -lt $args.Count) {
+                    $params.OutputPath = $args[$i + 1]
+                    $i++
+                }
+            }
+            "-DomainController" {
+                if ($i + 1 -lt $args.Count) {
+                    $params.DomainController = $args[$i + 1]
+                    $i++
+                }
+            }
+            "-Stealth" {
+                $params.Stealth = $true
+            }
+            "-Credential" {
+                if ($i + 1 -lt $args.Count) {
+                    $username = $args[$i + 1]
+                    $params.Credential = Get-Credential -UserName $username -Message "Enter password"
+                    $i++
+                }
+            }
+        }
     }
     
-    if ($DomainController) { $params.DomainController = $DomainController }
-    if ($Credential) { $params.Credential = $Credential }
+    # If no output path provided, use default
+    if (-not $params.OutputPath) {
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $params.OutputPath = "bloodhound_data_$timestamp.json"
+    }
     
+    # Run the collector
     Invoke-BloodHoundCollector @params
 }
-
-# Export the functions
-Export-ModuleMember -Function Invoke-BloodHoundCollector, Get-QuickCollection
