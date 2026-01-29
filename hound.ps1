@@ -11,32 +11,16 @@ function Invoke-BloodHoundCollector {
         [pscredential]$Credential,
         
         [Parameter(Mandatory = $false)]
-        [ValidateSet('All', 'Group', 'LocalGroup', 'GPOLocalGroup', 'Session', 'LoggedOn', 'ObjectProps', 
-                    'ACL', 'Container', 'RDP', 'PSRemote', 'DCOM', 'Trusts', 'Default', 'DCOnly')]
-        [string[]]$CollectionMethods = @('Default'),
+        [switch]$Stealth,
         
         [Parameter(Mandatory = $false)]
-        [int]$Throttle = 100,
-        
-        [Parameter(Mandatory = $false)]
-        [switch]$SkipGCDeconfliction,
-        
-        [Parameter(Mandatory = $false)]
-        [switch]$Stealth
+        [int]$Throttle = 1000
     )
-    
-    # Check for ActiveDirectory module
-    if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
-        Write-Error "ActiveDirectory module is not available. This script requires RSAT tools."
-        return
-    }
-    
-    Import-Module ActiveDirectory -ErrorAction Stop
     
     # Display banner
     Show-Banner
     
-    Write-Host "[*] Starting BloodHound Data Collection" -ForegroundColor Green
+    Write-Host "[*] Starting BloodHound Data Collection (LDAP Mode)" -ForegroundColor Green
     Write-Host "[*] Output will be saved to: $OutputPath" -ForegroundColor Yellow
     
     $startTime = Get-Date
@@ -47,7 +31,6 @@ function Invoke-BloodHoundCollector {
         OUs = 0
         GPOs = 0
         Domains = 0
-        Sessions = 0
         Relationships = 0
     }
     
@@ -70,24 +53,34 @@ function Invoke-BloodHoundCollector {
         }
     }
     
-    # Build search parameters
-    $searchParams = @{}
-    if ($DomainController) { $searchParams.Server = $DomainController }
-    if ($Credential) { $searchParams.Credential = $Credential }
-    
     try {
-        # 1. Collect Domain Information
-        Write-Host "[*] Collecting domain information..." -ForegroundColor Cyan
-        $domain = Get-ADDomain @searchParams -Properties *
-        $domainObject = Format-DomainForBloodHound -Domain $domain
-        $bloodHoundData.data.domains += $domainObject
+        # Get domain information
+        Write-Host "[*] Discovering domain information..." -ForegroundColor Cyan
+        $domainInfo = Get-DomainInfo -DomainController $DomainController -Credential $Credential
+        
+        if (-not $domainInfo) {
+            Write-Error "[-] Failed to discover domain information"
+            return
+        }
+        
+        $bloodHoundData.data.domains += @{
+            ObjectIdentifier = $domainInfo.DomainSid
+            Name = $domainInfo.DNSRoot
+            Properties = @{
+                name = $domainInfo.DNSRoot
+                domain = $domainInfo.DNSRoot
+                distinguishedname = $domainInfo.DistinguishedName
+                domainsid = $domainInfo.DomainSid
+                highvalue = $true
+            }
+        }
         $stats.Domains++
         
-        # 2. Collect Users
+        # Collect Users
         Write-Host "[*] Collecting users..." -ForegroundColor Cyan
-        $users = Get-ADUser -Filter * -Properties * @searchParams
+        $users = Get-ADObjects -ObjectClass "user" -DomainController $DomainController -Credential $Credential
         foreach ($user in $users) {
-            $userObject = Format-UserForBloodHound -User $user -Domain $domain
+            $userObject = Format-UserForBloodHound -Object $user -DomainInfo $domainInfo
             $bloodHoundData.data.users += $userObject
             $stats.Users++
             
@@ -96,11 +89,11 @@ function Invoke-BloodHoundCollector {
             }
         }
         
-        # 3. Collect Computers
+        # Collect Computers
         Write-Host "[*] Collecting computers..." -ForegroundColor Cyan
-        $computers = Get-ADComputer -Filter * -Properties * @searchParams
+        $computers = Get-ADObjects -ObjectClass "computer" -DomainController $DomainController -Credential $Credential
         foreach ($computer in $computers) {
-            $computerObject = Format-ComputerForBloodHound -Computer $computer -Domain $domain
+            $computerObject = Format-ComputerForBloodHound -Object $computer -DomainInfo $domainInfo
             $bloodHoundData.data.computers += $computerObject
             $stats.Computers++
             
@@ -109,11 +102,11 @@ function Invoke-BloodHoundCollector {
             }
         }
         
-        # 4. Collect Groups
+        # Collect Groups
         Write-Host "[*] Collecting groups..." -ForegroundColor Cyan
-        $groups = Get-ADGroup -Filter * -Properties * @searchParams
+        $groups = Get-ADObjects -ObjectClass "group" -DomainController $DomainController -Credential $Credential
         foreach ($group in $groups) {
-            $groupObject = Format-GroupForBloodHound -Group $group -Domain $domain
+            $groupObject = Format-GroupForBloodHound -Object $group -DomainInfo $domainInfo
             $bloodHoundData.data.groups += $groupObject
             $stats.Groups++
             
@@ -122,52 +115,35 @@ function Invoke-BloodHoundCollector {
             }
         }
         
-        # 5. Collect OUs
+        # Collect OUs
         Write-Host "[*] Collecting organizational units..." -ForegroundColor Cyan
-        $ous = Get-ADOrganizationalUnit -Filter * -Properties * @searchParams
+        $ous = Get-ADObjects -ObjectClass "organizationalUnit" -DomainController $DomainController -Credential $Credential
         foreach ($ou in $ous) {
-            $ouObject = Format-OUForBloodHound -OU $ou -Domain $domain
+            $ouObject = Format-OUForBloodHound -Object $ou -DomainInfo $domainInfo
             $bloodHoundData.data.ous += $ouObject
             $stats.OUs++
         }
         
-        # 6. Collect GPOs
+        # Collect GPOs
         Write-Host "[*] Collecting group policy objects..." -ForegroundColor Cyan
-        $gpos = Get-GPO -All -Domain $domain.DNSRoot -Server $DomainController @searchParams
+        $gpos = Get-GPOObjects -DomainController $DomainController -Credential $Credential -DomainInfo $domainInfo
         foreach ($gpo in $gpos) {
-            $gpoObject = Format-GPOForBloodHound -GPO $gpo -Domain $domain
-            $bloodHoundData.data.gpos += $gpoObject
+            $bloodHoundData.data.gpos += $gpo
             $stats.GPOs++
         }
         
-        # 7. Collect Group Memberships
+        # Collect Group Memberships
         Write-Host "[*] Collecting group memberships..." -ForegroundColor Cyan
-        $groupMemberships = Get-GroupMemberships @searchParams
+        $groupMemberships = Get-GroupMembershipsLDAP -DomainController $DomainController -Credential $Credential -DomainInfo $domainInfo
         $bloodHoundData.data.relationships += $groupMemberships
         $stats.Relationships += $groupMemberships.Count
-        
-        # 8. Collect ACLs (if not in stealth mode)
-        if (-not $Stealth) {
-            Write-Host "[*] Collecting ACLs (this may take a while)..." -ForegroundColor Cyan
-            $acls = Get-ACLsForBloodHound @searchParams
-            $bloodHoundData.data.relationships += $acls
-            $stats.Relationships += $acls.Count
-        }
-        
-        # 9. Collect Sessions (if not in stealth mode)
-        if (-not $Stealth) {
-            Write-Host "[*] Collecting sessions..." -ForegroundColor Cyan
-            $sessions = Get-SessionsForBloodHound @searchParams
-            $bloodHoundData.data.sessions += $sessions
-            $stats.Sessions += $sessions.Count
-        }
         
         # Update meta count
         $bloodHoundData.meta.count = $stats.Users + $stats.Computers + $stats.Groups + $stats.OUs + $stats.GPOs + $stats.Domains
         
         # Convert to JSON and save
         Write-Host "[*] Converting to JSON format..." -ForegroundColor Cyan
-        $jsonData = ConvertTo-Json -InputObject $bloodHoundData -Depth 10
+        $jsonData = $bloodHoundData | ConvertTo-Json -Depth 10
         
         # Save to file
         $jsonData | Out-File -FilePath $OutputPath -Encoding UTF8
@@ -185,7 +161,6 @@ function Invoke-BloodHoundCollector {
         Write-Host "  Groups: $($stats.Groups)" -ForegroundColor White
         Write-Host "  OUs: $($stats.OUs)" -ForegroundColor White
         Write-Host "  GPOs: $($stats.GPOs)" -ForegroundColor White
-        Write-Host "  Sessions: $($stats.Sessions)" -ForegroundColor White
         Write-Host "  Relationships: $($stats.Relationships)" -ForegroundColor White
         Write-Host "  Duration: $($duration.ToString('hh\:mm\:ss'))" -ForegroundColor White
         Write-Host "  Output File: $OutputPath" -ForegroundColor Green
@@ -194,7 +169,8 @@ function Invoke-BloodHoundCollector {
     }
     catch {
         Write-Error "Collection failed: $_"
-        throw
+        Write-Host "[!] Error details: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "[!] Stack trace: $($_.Exception.StackTrace)" -ForegroundColor Red
     }
 }
 
@@ -207,293 +183,475 @@ function Show-Banner {
  |  _ <| | | |  __/  __/ | | | | | |_| | |_| | | | (_) | (_| | |_| | | | | (__ 
  |_| \_\_| |_|\___|\___|_| |_| |_|\__,_|\__|_| |_|\___/ \__,_|\__,_|_| |_|\___|
                                                                                 
-                    BloodHound Data Collector for PowerShell
+                    BloodHound Data Collector (LDAP Version)
+                    No RSAT Required - Works Everywhere
 ================================================================================
 "@
     Write-Host $banner -ForegroundColor Cyan
 }
 
-function Format-DomainForBloodHound {
+# Core LDAP functions
+function Get-DomainInfo {
     param(
-        $Domain
+        [string]$DomainController,
+        [pscredential]$Credential
     )
     
-    return @{
-        ObjectIdentifier = $Domain.DomainSID.Value
-        Name = $Domain.DNSRoot
-        Properties = @{
-            name = $Domain.DNSRoot
-            domain = $Domain.DNSRoot
-            distinguishedname = $Domain.DistinguishedName
-            domainsid = $Domain.DomainSID.Value
-            highvalue = $true
+    try {
+        # Create directory entry for RootDSE
+        if ($Credential) {
+            $de = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$DomainController/RootDSE", $Credential.UserName, $Credential.GetNetworkCredential().Password)
+        }
+        elseif ($DomainController) {
+            $de = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$DomainController/RootDSE")
+        }
+        else {
+            $de = New-Object System.DirectoryServices.DirectoryEntry("LDAP://RootDSE")
+        }
+        
+        $domainDNS = $de.defaultNamingContext
+        $configContext = $de.configurationNamingContext
+        
+        # Get domain object for SID
+        if ($Credential) {
+            $domainDE = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$DomainController/$domainDNS", $Credential.UserName, $Credential.GetNetworkCredential().Password)
+        }
+        elseif ($DomainController) {
+            $domainDE = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$DomainController/$domainDNS")
+        }
+        else {
+            $domainDE = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$domainDNS")
+        }
+        
+        $domainSearcher = New-Object System.DirectoryServices.DirectorySearcher($domainDE)
+        $domainSearcher.Filter = "(objectClass=domain)"
+        $domainSearcher.PropertiesToLoad.AddRange(@("objectSid", "name", "distinguishedName"))
+        $domainResult = $domainSearcher.FindOne()
+        
+        if ($domainResult) {
+            $domainSid = (New-Object System.Security.Principal.SecurityIdentifier($domainResult.Properties["objectsid"][0], 0)).Value
+            
+            return @{
+                DNSRoot = $domainDNS -replace 'DC=','' -replace ',','.' -replace 'DC=',''
+                DistinguishedName = $domainDNS
+                DomainSid = $domainSid
+                NetBIOSName = $domainResult.Properties["name"][0]
+                ConfigurationContext = $configContext
+            }
         }
     }
+    catch {
+        Write-Host "[-] Error getting domain info: $_" -ForegroundColor Red
+    }
+    
+    return $null
 }
 
+function Get-ADObjects {
+    param(
+        [string]$ObjectClass,
+        [string]$DomainController,
+        [pscredential]$Credential,
+        [string]$SearchBase,
+        [int]$PageSize = 1000
+    )
+    
+    $objects = @()
+    
+    try {
+        # Determine LDAP path
+        $ldapPath = "LDAP://"
+        if ($DomainController) {
+            $ldapPath += "$DomainController/"
+        }
+        
+        if ($SearchBase) {
+            $ldapPath += $SearchBase
+        }
+        else {
+            # Get domain if not provided
+            $domainInfo = Get-DomainInfo -DomainController $DomainController -Credential $Credential
+            if ($domainInfo) {
+                $ldapPath += $domainInfo.DistinguishedName
+            }
+        }
+        
+        # Create directory entry
+        if ($Credential) {
+            $de = New-Object System.DirectoryServices.DirectoryEntry($ldapPath, $Credential.UserName, $Credential.GetNetworkCredential().Password)
+        }
+        else {
+            $de = New-Object System.DirectoryServices.DirectoryEntry($ldapPath)
+        }
+        
+        # Create searcher
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher($de)
+        $searcher.Filter = "(objectClass=$ObjectClass)"
+        $searcher.PageSize = $PageSize
+        
+        # Load common properties
+        $searcher.PropertiesToLoad.AddRange(@(
+            "distinguishedName",
+            "name",
+            "objectSid",
+            "objectGUID",
+            "objectClass",
+            "whenCreated",
+            "whenChanged",
+            "description",
+            "samAccountName",
+            "userPrincipalName",
+            "adminCount",
+            "userAccountControl",
+            "lastLogon",
+            "lastLogonTimestamp",
+            "pwdLastSet",
+            "operatingSystem",
+            "operatingSystemVersion",
+            "memberOf",
+            "member",
+            "gPLink",
+            "displayName",
+            "mail",
+            "title"
+        ))
+        
+        # Perform search
+        $results = $searcher.FindAll()
+        
+        foreach ($result in $results) {
+            $objProps = @{}
+            foreach ($propName in $result.Properties.PropertyNames) {
+                $objProps[$propName] = $result.Properties[$propName]
+            }
+            $objects += $objProps
+        }
+        
+        $results.Dispose()
+        $de.Dispose()
+    }
+    catch {
+        Write-Host "[-] Error getting $ObjectClass objects: $_" -ForegroundColor Red
+    }
+    
+    return $objects
+}
+
+function Get-GPOObjects {
+    param(
+        [string]$DomainController,
+        [pscredential]$Credential,
+        $DomainInfo
+    )
+    
+    $gpos = @()
+    
+    try {
+        # GPOs are in the Policies container
+        $policiesPath = "CN=Policies,CN=System,$($DomainInfo.DistinguishedName)"
+        
+        $gpoObjects = Get-ADObjects -ObjectClass "groupPolicyContainer" -DomainController $DomainController -Credential $Credential -SearchBase $policiesPath
+        
+        foreach ($gpo in $gpoObjects) {
+            $gpos += @{
+                ObjectIdentifier = [System.BitConverter]::ToString($gpo["objectGUID"][0]).Replace("-", "").ToLower()
+                Properties = @{
+                    name = if ($gpo["displayName"]) { $gpo["displayName"][0] } else { "Unknown GPO" }
+                    distinguishedname = if ($gpo["distinguishedName"]) { $gpo["distinguishedName"][0] } else { "" }
+                    domain = $DomainInfo.DNSRoot
+                    domainsid = $DomainInfo.DomainSid
+                    gpostatus = "Enabled"
+                }
+            }
+        }
+    }
+    catch {
+        Write-Host "[-] Error getting GPOs: $_" -ForegroundColor Red
+    }
+    
+    return $gpos
+}
+
+function Get-GroupMembershipsLDAP {
+    param(
+        [string]$DomainController,
+        [pscredential]$Credential,
+        $DomainInfo
+    )
+    
+    $relationships = @()
+    
+    Write-Host "  [*] Getting group members..." -ForegroundColor Yellow
+    
+    try {
+        $groups = Get-ADObjects -ObjectClass "group" -DomainController $DomainController -Credential $Credential
+        
+        foreach ($group in $groups) {
+            if ($group["member"]) {
+                $groupId = [System.BitConverter]::ToString($group["objectGUID"][0]).Replace("-", "").ToLower()
+                
+                foreach ($memberDN in $group["member"]) {
+                    try {
+                        # Try to resolve the member
+                        $member = Get-ADObjectByDN -DistinguishedName $memberDN -DomainController $DomainController -Credential $Credential
+                        
+                        if ($member -and $member["objectGUID"]) {
+                            $memberId = [System.BitConverter]::ToString($member["objectGUID"][0]).Replace("-", "").ToLower()
+                            
+                            $relationships += @{
+                                StartNode = $memberId
+                                EndNode = $groupId
+                                Relationship = 'MemberOf'
+                                Properties = @{}
+                            }
+                        }
+                    }
+                    catch {
+                        # Skip if we can't resolve
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        Write-Host "[-] Error getting group memberships: $_" -ForegroundColor Red
+    }
+    
+    return $relationships
+}
+
+function Get-ADObjectByDN {
+    param(
+        [string]$DistinguishedName,
+        [string]$DomainController,
+        [pscredential]$Credential
+    )
+    
+    try {
+        $ldapPath = "LDAP://"
+        if ($DomainController) {
+            $ldapPath += "$DomainController/"
+        }
+        $ldapPath += $DistinguishedName
+        
+        if ($Credential) {
+            $de = New-Object System.DirectoryServices.DirectoryEntry($ldapPath, $Credential.UserName, $Credential.GetNetworkCredential().Password)
+        }
+        else {
+            $de = New-Object System.DirectoryServices.DirectoryEntry($ldapPath)
+        }
+        
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher($de)
+        $searcher.Filter = "(objectClass=*)"
+        $searcher.PropertiesToLoad.AddRange(@("objectGUID", "objectSid", "name", "objectClass"))
+        
+        $result = $searcher.FindOne()
+        
+        if ($result) {
+            $objProps = @{}
+            foreach ($propName in $result.Properties.PropertyNames) {
+                $objProps[$propName] = $result.Properties[$propName]
+            }
+            return $objProps
+        }
+    }
+    catch {
+        # Object not found or access denied
+    }
+    
+    return $null
+}
+
+# Formatting functions
 function Format-UserForBloodHound {
     param(
-        $User,
-        $Domain
+        $Object,
+        $DomainInfo
     )
     
     $highValue = $false
     $adminCount = 0
     
-    if ($User.AdminCount -eq 1) {
+    if ($Object["adminCount"] -and $Object["adminCount"][0] -eq 1) {
         $adminCount = 1
         $highValue = $true
     }
     
-    # Check if user is in high-value groups
-    if ($User.MemberOf -match "Domain Admins|Enterprise Admins|Schema Admins|Administrators") {
-        $highValue = $true
+    # Check UAC for disabled accounts
+    $enabled = $true
+    if ($Object["userAccountControl"]) {
+        $uac = $Object["userAccountControl"][0]
+        # Check if account is disabled (bit 2)
+        if (($uac -band 2) -eq 2) {
+            $enabled = $false
+        }
+    }
+    
+    # Get SID
+    $objectSid = ""
+    if ($Object["objectSid"]) {
+        $objectSid = (New-Object System.Security.Principal.SecurityIdentifier($Object["objectSid"][0], 0)).Value
     }
     
     return @{
-        ObjectIdentifier = $User.SID.Value
+        ObjectIdentifier = $objectSid
         Properties = @{
-            name = $User.SamAccountName
-            distinguishedname = $User.DistinguishedName
-            domain = $Domain.DNSRoot
-            domainsid = $Domain.DomainSID.Value
-            enabled = ($User.Enabled -eq $true)
-            pwdlastset = if ($User.PasswordLastSet) { $User.PasswordLastSet.ToString('yyyy-MM-ddTHH:mm:ss') } else { $null }
-            lastlogon = if ($User.LastLogonDate) { $User.LastLogonDate.ToString('yyyy-MM-ddTHH:mm:ss') } else { $null }
-            lastlogontimestamp = if ($User.LastLogonTimestamp) { $User.LastLogonTimestamp.ToString('yyyy-MM-ddTHH:mm:ss') } else { $null }
-            sidhistory = if ($User.SIDHistory) { $User.SIDHistory.Value } else { $null }
+            name = if ($Object["samAccountName"]) { $Object["samAccountName"][0] } else { $Object["name"][0] }
+            distinguishedname = $Object["distinguishedName"][0]
+            domain = $DomainInfo.DNSRoot
+            domainsid = $DomainInfo.DomainSid
+            enabled = $enabled
+            pwdlastset = if ($Object["pwdLastSet"]) { Convert-ADSTimestamp $Object["pwdLastSet"][0] } else { $null }
+            lastlogon = if ($Object["lastLogon"]) { Convert-ADSTimestamp $Object["lastLogon"][0] } else { $null }
+            lastlogontimestamp = if ($Object["lastLogonTimestamp"]) { Convert-ADSTimestamp $Object["lastLogonTimestamp"][0] } else { $null }
             admincount = $adminCount
             highvalue = $highValue
-            email = $User.Email
-            description = $User.Description
-            title = $User.Title
+            email = if ($Object["mail"]) { $Object["mail"][0] } else { $null }
+            description = if ($Object["description"]) { $Object["description"][0] } else { $null }
+            title = if ($Object["title"]) { $Object["title"][0] } else { $null }
             haslaps = $false
             hasspn = $false
             dontreqpreauth = $false
             sensitive = $false
-            passwordnotreqd = if ($User.PasswordNotRequired) { $true } else { $false }
-            pwdneverexpires = if ($User.PasswordNeverExpires) { $true } else { $false }
-            spn = @()
+            passwordnotreqd = $false
+            pwdneverexpires = $false
         }
     }
 }
 
 function Format-ComputerForBloodHound {
     param(
-        $Computer,
-        $Domain
+        $Object,
+        $DomainInfo
     )
     
     $highValue = $false
     $adminCount = 0
     
-    if ($Computer.AdminCount -eq 1) {
+    if ($Object["adminCount"] -and $Object["adminCount"][0] -eq 1) {
         $adminCount = 1
         $highValue = $true
     }
     
     # Check if computer is a domain controller
-    if ($Computer.OperatingSystem -like "*Windows Server*" -and $Computer.Name -like "*DC*") {
+    $computerName = if ($Object["name"]) { $Object["name"][0] } else { "" }
+    if ($computerName -like "*DC*" -or $computerName -like "*PDC*" -or $computerName -like "*ADC*") {
         $highValue = $true
     }
     
+    # Get SID
+    $objectSid = ""
+    if ($Object["objectSid"]) {
+        $objectSid = (New-Object System.Security.Principal.SecurityIdentifier($Object["objectSid"][0], 0)).Value
+    }
+    
     return @{
-        ObjectIdentifier = $Computer.SID.Value
+        ObjectIdentifier = $objectSid
         Properties = @{
-            name = $Computer.Name.ToUpper()
-            distinguishedname = $Computer.DistinguishedName
-            domain = $Domain.DNSRoot
-            domainsid = $Domain.DomainSID.Value
-            enabled = ($Computer.Enabled -eq $true)
-            pwdlastset = if ($Computer.PasswordLastSet) { $Computer.PasswordLastSet.ToString('yyyy-MM-ddTHH:mm:ss') } else { $null }
-            lastlogon = if ($Computer.LastLogonDate) { $Computer.LastLogonDate.ToString('yyyy-MM-ddTHH:mm:ss') } else { $null }
-            lastlogontimestamp = if ($Computer.LastLogonTimestamp) { $Computer.LastLogonTimestamp.ToString('yyyy-MM-ddTHH:mm:ss') } else { $null }
-            operatingsystem = $Computer.OperatingSystem
-            operatingsystemversion = $Computer.OperatingSystemVersion
-            sidhistory = if ($Computer.SIDHistory) { $Computer.SIDHistory.Value } else { $null }
+            name = $computerName.ToUpper()
+            distinguishedname = $Object["distinguishedName"][0]
+            domain = $DomainInfo.DNSRoot
+            domainsid = $DomainInfo.DomainSid
+            enabled = $true  # Default, could check UAC if available
+            pwdlastset = if ($Object["pwdLastSet"]) { Convert-ADSTimestamp $Object["pwdLastSet"][0] } else { $null }
+            lastlogon = if ($Object["lastLogon"]) { Convert-ADSTimestamp $Object["lastLogon"][0] } else { $null }
+            lastlogontimestamp = if ($Object["lastLogonTimestamp"]) { Convert-ADSTimestamp $Object["lastLogonTimestamp"][0] } else { $null }
+            operatingsystem = if ($Object["operatingSystem"]) { $Object["operatingSystem"][0] } else { $null }
+            operatingsystemversion = if ($Object["operatingSystemVersion"]) { $Object["operatingSystemVersion"][0] } else { $null }
             admincount = $adminCount
             highvalue = $highValue
             haslaps = $false
             hasspn = $false
             unconstraineddelegation = $false
             trustedtoauth = $false
-            description = $Computer.Description
-            serviceprincipalnames = @()
+            description = if ($Object["description"]) { $Object["description"][0] } else { $null }
         }
     }
 }
 
 function Format-GroupForBloodHound {
     param(
-        $Group,
-        $Domain
+        $Object,
+        $DomainInfo
     )
     
     $highValue = $false
     $adminCount = 0
+    
+    $groupName = if ($Object["name"]) { $Object["name"][0] } else { "" }
     
     # Check if this is a high value group
     $highValueGroups = @('Domain Admins', 'Enterprise Admins', 'Schema Admins', 
                          'Administrators', 'Account Operators', 'Backup Operators',
                          'Print Operators', 'Server Operators', 'Domain Controllers')
     
-    if ($highValueGroups -contains $Group.Name) {
+    if ($highValueGroups -contains $groupName) {
         $highValue = $true
     }
     
-    if ($Group.AdminCount -eq 1) {
+    if ($Object["adminCount"] -and $Object["adminCount"][0] -eq 1) {
         $adminCount = 1
         $highValue = $true
     }
     
+    # Get SID
+    $objectSid = ""
+    if ($Object["objectSid"]) {
+        $objectSid = (New-Object System.Security.Principal.SecurityIdentifier($Object["objectSid"][0], 0)).Value
+    }
+    
     return @{
-        ObjectIdentifier = $Group.SID.Value
+        ObjectIdentifier = $objectSid
         Properties = @{
-            name = $Group.Name
-            distinguishedname = $Group.DistinguishedName
-            domain = $Domain.DNSRoot
-            domainsid = $Domain.DomainSID.Value
+            name = $groupName
+            distinguishedname = $Object["distinguishedName"][0]
+            domain = $DomainInfo.DNSRoot
+            domainsid = $DomainInfo.DomainSid
             admincount = $adminCount
             highvalue = $highValue
-            description = $Group.Description
+            description = if ($Object["description"]) { $Object["description"][0] } else { $null }
         }
     }
 }
 
 function Format-OUForBloodHound {
     param(
-        $OU,
-        $Domain
+        $Object,
+        $DomainInfo
     )
     
-    return @{
-        ObjectIdentifier = $OU.ObjectGUID.Guid
-        Properties = @{
-            name = $OU.Name
-            distinguishedname = $OU.DistinguishedName
-            domain = $Domain.DNSRoot
-            domainsid = $Domain.DomainSID.Value
-            gplink = $OU.gPLink
-        }
-    }
-}
-
-function Format-GPOForBloodHound {
-    param(
-        $GPO,
-        $Domain
-    )
+    $guid = [System.BitConverter]::ToString($Object["objectGUID"][0]).Replace("-", "").ToLower()
     
     return @{
-        ObjectIdentifier = $GPO.Id.Guid
+        ObjectIdentifier = $guid
         Properties = @{
-            name = $GPO.DisplayName
-            distinguishedname = "CN=$($GPO.Id),CN=Policies,CN=System,$($Domain.DistinguishedName)"
-            domain = $Domain.DNSRoot
-            domainsid = $Domain.DomainSID.Value
-            gpostatus = "Enabled"
+            name = $Object["name"][0]
+            distinguishedname = $Object["distinguishedName"][0]
+            domain = $DomainInfo.DNSRoot
+            domainsid = $DomainInfo.DomainSid
+            gplink = if ($Object["gPLink"]) { $Object["gPLink"][0] } else { $null }
         }
     }
 }
 
-function Get-GroupMemberships {
-    param($searchParams)
+function Convert-ADSTimestamp {
+    param([int64]$timestamp)
     
-    $relationships = @()
-    
-    Write-Host "  [*] Getting group members..." -ForegroundColor Yellow
-    
-    $groups = Get-ADGroup -Filter * -Properties Members @searchParams
-    
-    foreach ($group in $groups) {
-        if ($group.Members) {
-            foreach ($member in $group.Members) {
-                try {
-                    $memberObj = Get-ADObject -Identity $member -Properties ObjectSID, ObjectGUID @searchParams -ErrorAction SilentlyContinue
-                    if ($memberObj) {
-                        $relationships += @{
-                            StartNode = if ($memberObj.ObjectSid) { $memberObj.ObjectSid.Value } else { $memberObj.ObjectGUID.Guid }
-                            EndNode = $group.SID.Value
-                            Relationship = 'MemberOf'
-                            Properties = @{}
-                        }
-                    }
-                }
-                catch {
-                    # Skip if we can't resolve the member
-                }
-            }
-        }
+    if ($timestamp -eq 0 -or $timestamp -eq 9223372036854775807) {
+        return $null
     }
     
-    return $relationships
-}
-
-function Get-ACLsForBloodHound {
-    param($searchParams)
-    
-    $relationships = @()
-    Write-Host "  [*] Collecting ACLs (this is CPU intensive)..." -ForegroundColor Yellow
-    
-    # Get high value targets first
-    $highValueObjects = @()
-    
-    # Domain Admins group
     try {
-        $domainAdmins = Get-ADGroup -Identity "Domain Admins" -Properties nTSecurityDescriptor @searchParams
-        $highValueObjects += $domainAdmins
-    } catch {}
-    
-    # Enterprise Admins group
-    try {
-        $enterpriseAdmins = Get-ADGroup -Identity "Enterprise Admins" -Properties nTSecurityDescriptor @searchParams
-        $highValueObjects += $enterpriseAdmins
-    } catch {}
-    
-    # Domain Controllers OU
-    try {
-        $dcOU = Get-ADOrganizationalUnit -Identity "Domain Controllers" -Properties nTSecurityDescriptor @searchParams
-        $highValueObjects += $dcOU
-    } catch {}
-    
-    # Process ACLs for high value objects
-    foreach ($object in $highValueObjects) {
-        if ($object.nTSecurityDescriptor) {
-            $acl = $object.nTSecurityDescriptor
-            foreach ($ace in $acl.Access) {
-                if ($ace.IdentityReference) {
-                    $relationships += @{
-                        StartNode = $ace.IdentityReference.Value
-                        EndNode = if ($object.ObjectSid) { $object.ObjectSid.Value } else { $object.ObjectGUID.Guid }
-                        Relationship = $ace.AccessControlType.ToString()
-                        Properties = @{
-                            AceType = $ace.ActiveDirectoryRights.ToString()
-                            IsInherited = $ace.IsInherited
-                        }
-                    }
-                }
-            }
-        }
+        $epoch = Get-Date "1601-01-01 00:00:00"
+        $date = $epoch.AddTicks($timestamp * 10)
+        return $date.ToString("yyyy-MM-ddTHH:mm:ss")
     }
-    
-    return $relationships
+    catch {
+        return $null
+    }
 }
 
-function Get-SessionsForBloodHound {
-    param($searchParams)
-    
-    $sessions = @()
-    
-    # This is a simplified version. Real session collection would require
-    # querying each computer for logged on users, which is noisy.
-    # For now, we'll create placeholder sessions for demo purposes.
-    
-    Write-Host "  [*] Note: Session collection would be noisy. Skipping detailed session collection." -ForegroundColor Yellow
-    
-    return $sessions
-}
-
-# Main execution if script is run directly
+# Main execution
 if ($MyInvocation.InvocationName -ne '.') {
     # Parse command line arguments
     $params = @{}
