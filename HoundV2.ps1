@@ -1,1035 +1,793 @@
-# Save as ADMapper.ps1
+# Save as ADStructureMapper.ps1
 param(
     [string]$DomainController,
-    [string]$OutputPath = "ad_complete_map.json",
-    [switch]$SkipUsers,
-    [switch]$SkipComputers,
-    [switch]$NoACLs,
-    [int]$Timeout = 180  # 3 minutes max
+    [string]$OutputPath = "ad_structure.json",
+    [switch]$UseIPAddress,
+    [switch]$NoDNS,
+    [int]$Timeout = 120
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 $startTime = Get-Date
-$global:timeoutReached = $false
-
-# ==================== TIMEOUT HANDLER ====================
-$timeoutTimer = New-Object System.Timers.Timer
-$timeoutTimer.Interval = $Timeout * 1000
-$timeoutTimer.Enabled = $true
-$timeoutTimer.AutoReset = $false
-Register-ObjectEvent -InputObject $timeoutTimer -EventName Elapsed -SourceIdentifier TimeoutReached -Action {
-    $global:timeoutReached = $true
-    Write-Host "[!] Timeout reached! Finishing current operations..." -ForegroundColor Red
-}
 
 # ==================== BANNER ====================
 Write-Host @"
 ===============================================================
-    ___    ____  __  __                            
-   /   |  / __ \/ / / /___  ____  ____ _____ ___ 
-  / /| | / / / / /_/ / __ \/ __ \/ __ '/ __ '__ \
- / ___ |/ /_/ / __  / /_/ / /_/ / /_/ / / / / / /
-/_/  |_/_____/_/ /_/\____/ .___/\__,_/_/ /_/ /_/ 
-                        /_/                        
-
-           Complete AD Structure Mapper
-           (Excluding User Details for Speed)
+    ____  _____     __  ___      __           __  ___          
+   / __ \/ ___/    /  |/  /___ _/ /_____     /  |/  /___ _____ 
+  / / / /\__ \    / /|_/ / __ '/ __/ __ \   / /|_/ / __ '/ __ \
+ / /_/ /___/ /   / /  / / /_/ / /_/ /_/ /  / /  / / /_/ / /_/ /
+/_____//____/   /_/  /_/\__,_/\__/\____/  /_/  /_/\__,_/ .___/ 
+                                                     /_/        
+            Active Directory Structure Mapper
+            Resilient Version with Error Handling
 ===============================================================
 "@ -ForegroundColor Cyan
 
-# ==================== CONFIGURATION ====================
-$config = @{
-    CollectOUs = $true
-    CollectGroups = $true
-    CollectGPOs = $true
-    CollectComputers = (-not $SkipComputers)
-    CollectTrusts = $true
-    CollectSites = $true
-    CollectSubnets = $true
-    CollectSchema = $true
-    CollectACLs = (-not $NoACLs)
-    CollectDelegation = $true
-    CollectServiceAccounts = $true
-    CollectLAPS = $true
-    CollectCertTemplates = $true
-}
-
-# ==================== DATA STRUCTURE ====================
-$adMap = @{
-    Meta = @{
-        ScriptVersion = "2.0"
-        CollectionTime = $startTime.ToString("yyyy-MM-dd HH:mm:ss")
-        DomainController = $DomainController
-        Parameters = @{
-            SkipUsers = $SkipUsers
-            SkipComputers = $SkipComputers
-            NoACLs = $NoACLs
-        }
-    }
-    Domain = @{}
-    Forest = @{}
-    OUs = @()
-    Groups = @{
-        Builtin = @()
-        Security = @()
-        Distribution = @()
-        HighValue = @()
-        AdminCount = @()
-        NestedGroups = @()
-    }
-    GPOs = @()
-    Computers = @{
-        DomainControllers = @()
-        Servers = @()
-        Workstations = @()
-        LAPSEnabled = @()
-    }
-    Sites = @()
-    Subnets = @()
-    Trusts = @()
-    Schema = @{}
-    Delegation = @()
-    ServiceAccounts = @()
-    CertificateTemplates = @()
-    ACLs = @{
-        CriticalPaths = @()
-        GPODelegation = @()
-    }
-    Statistics = @{}
-}
-
-# ==================== CONNECTION ====================
-function Test-Connection {
-    Write-Host "[*] Testing connection..." -ForegroundColor Yellow
+# ==================== CONNECTION UTILITIES ====================
+function Test-LDAPConnection {
+    param([string]$Server, [switch]$UseIP, [switch]$SkipDNS)
     
+    Write-Host "[*] Testing LDAP connection..." -ForegroundColor Yellow
+    
+    $connectionMethods = @()
+    $successfulMethod = $null
+    
+    # Method 1: Try direct ADSI with RootDSE
     try {
-        if ($DomainController) {
-            $ldapPath = "LDAP://$DomainController/RootDSE"
+        if ($UseIP -or $SkipDNS) {
+            # Use IP or hostname without DNS resolution
+            $serverToUse = if ($Server) { $Server } else { [System.Net.Dns]::GetHostName() }
+            $ldapPath = "LDAP://$serverToUse/RootDSE"
         } else {
-            $ldapPath = "LDAP://RootDSE"
+            $ldapPath = if ($Server) { "LDAP://$Server/RootDSE" } else { "LDAP://RootDSE" }
         }
         
+        Write-Host "  [*] Trying: $ldapPath" -ForegroundColor Gray
         $rootDSE = [ADSI]$ldapPath
-        
         $domainDN = $rootDSE.defaultNamingContext
-        $configDN = $rootDSE.configurationNamingContext
-        $schemaDN = $rootDSE.schemaNamingContext
-        $domainName = ($domainDN -replace 'DC=','' -replace ',','.' -replace 'DC=','').ToUpper()
+        $serverName = $rootDSE.dnsHostName
         
-        Write-Host "[+] Connected to domain: $domainName" -ForegroundColor Green
-        Write-Host "[+] Domain DN: $domainDN" -ForegroundColor Gray
-        Write-Host "[+] Configuration DN: $configDN" -ForegroundColor Gray
+        $connectionMethods += @{
+            Method = "ADSI RootDSE"
+            Status = "SUCCESS"
+            Domain = ($domainDN -replace 'DC=','' -replace ',','.' -replace 'DC=','').ToUpper()
+            Server = $serverName
+        }
         
-        return @{
+        $successfulMethod = @{
+            Type = "ADSI"
             RootDSE = $rootDSE
             DomainDN = $domainDN
-            ConfigDN = $configDN
-            SchemaDN = $schemaDN
-            DomainName = $domainName
-            Server = $DomainController
+            Server = if ($Server) { $Server } else { $serverName }
+        }
+        
+        Write-Host "  [+] Connected via ADSI to $serverName" -ForegroundColor Green
+    } catch {
+        $connectionMethods += @{
+            Method = "ADSI RootDSE"
+            Status = "FAILED: $_"
         }
     }
-    catch {
-        Write-Host "[!] Connection failed: $_" -ForegroundColor Red
-        Write-Host "[!] Try specifying -DomainController parameter" -ForegroundColor Yellow
-        exit 1
+    
+    # Method 2: Try System.DirectoryServices.DirectoryEntry
+    if (-not $successfulMethod) {
+        try {
+            Write-Host "  [*] Trying DirectoryEntry..." -ForegroundColor Gray
+            $de = New-Object System.DirectoryServices.DirectoryEntry
+            if ($Server) { $de.Path = "LDAP://$Server" }
+            $de.RefreshCache()
+            
+            if ($de.Properties["distinguishedName"]) {
+                $connectionMethods += @{
+                    Method = "DirectoryEntry"
+                    Status = "SUCCESS"
+                    Domain = $de.Properties["distinguishedName"][0]
+                }
+                
+                $successfulMethod = @{
+                    Type = "DirectoryEntry"
+                    Object = $de
+                    Server = $Server
+                }
+                
+                Write-Host "  [+] Connected via DirectoryEntry" -ForegroundColor Green
+            }
+        } catch {
+            $connectionMethods += @{
+                Method = "DirectoryEntry"
+                Status = "FAILED: $_"
+            }
+        }
     }
+    
+    # Method 3: Try .NET DirectoryContext
+    if (-not $successfulMethod) {
+        try {
+            Write-Host "  [*] Trying .NET DirectoryContext..." -ForegroundColor Gray
+            Add-Type -AssemblyName System.DirectoryServices.Protocols -ErrorAction SilentlyContinue
+            
+            if ($Server) {
+                $context = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext(
+                    [System.DirectoryServices.ActiveDirectory.DirectoryContextType]::DirectoryServer,
+                    $Server
+                )
+            } else {
+                $context = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext(
+                    [System.DirectoryServices.ActiveDirectory.DirectoryContextType]::Domain
+                )
+            }
+            
+            $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetDomain($context)
+            
+            $connectionMethods += @{
+                Method = ".NET DirectoryContext"
+                Status = "SUCCESS"
+                Domain = $domain.Name
+                Server = $domain.DomainControllers[0].Name
+            }
+            
+            $successfulMethod = @{
+                Type = ".NET"
+                Domain = $domain
+                Server = $domain.DomainControllers[0].Name
+            }
+            
+            Write-Host "  [+] Connected via .NET DirectoryContext" -ForegroundColor Green
+        } catch {
+            $connectionMethods += @{
+                Method = ".NET DirectoryContext"
+                Status = "FAILED: $_"
+            }
+        }
+    }
+    
+    # Method 4: Try direct LDAP connection using .NET
+    if (-not $successfulMethod) {
+        try {
+            Write-Host "  [*] Trying raw LDAP connection..." -ForegroundColor Gray
+            
+            # Create an LDAP connection
+            $ldapIdentifier = if ($Server) { $Server } else { [System.Net.Dns]::GetHostName() }
+            
+            $conn = New-Object System.DirectoryServices.Protocols.LdapConnection($ldapIdentifier)
+            $conn.SessionOptions.ProtocolVersion = 3
+            $conn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Anonymous
+            
+            $request = New-Object System.DirectoryServices.Protocols.SearchRequest
+            $request.DistinguishedName = ""
+            $request.Filter = "(objectClass=*)"
+            $request.Scope = [System.DirectoryServices.Protocols.SearchScope]::Base
+            
+            $response = $conn.SendRequest($request)
+            
+            $connectionMethods += @{
+                Method = "Raw LDAP"
+                Status = "SUCCESS"
+            }
+            
+            $successfulMethod = @{
+                Type = "RawLDAP"
+                Connection = $conn
+                Server = $ldapIdentifier
+            }
+            
+            Write-Host "  [+] Connected via raw LDAP" -ForegroundColor Green
+        } catch {
+            $connectionMethods += @{
+                Method = "Raw LDAP"
+                Status = "FAILED: $_"
+            }
+        }
+    }
+    
+    if (-not $successfulMethod) {
+        Write-Host "[!] All connection methods failed!" -ForegroundColor Red
+        Write-Host "`nTroubleshooting tips:" -ForegroundColor Yellow
+        Write-Host "1. Run as Administrator" -ForegroundColor White
+        Write-Host "2. Ensure you're on the domain network" -ForegroundColor White
+        Write-Host "3. Try specifying -DomainController parameter" -ForegroundColor White
+        Write-Host "4. Try -UseIPAddress with DC's IP" -ForegroundColor White
+        Write-Host "5. Check firewall allows LDAP (389/636)" -ForegroundColor White
+        Write-Host "6. Run: Test-NetConnection -ComputerName DC01 -Port 389" -ForegroundColor White
+        
+        return $null
+    }
+    
+    return $successfulMethod
 }
 
-# ==================== DOMAIN INFO ====================
-function Get-DomainInfo {
-    param($Connection)
-    
-    Write-Host "`n[*] Getting domain information..." -ForegroundColor Green
+# ==================== SAFE ENUMERATION FUNCTIONS ====================
+function Safe-GetDomainInfo {
+    Write-Host "`n[*] Getting domain information (safe mode)..." -ForegroundColor Green
     
     try {
-        $domainSearch = [ADSISearcher]"(objectClass=domain)"
-        $domainSearch.SearchRoot = [ADSI]"LDAP://$($Connection.Server)/$($Connection.DomainDN)"
-        $domainSearch.PropertiesToLoad.AddRange(@(
-            "objectSid", "name", "distinguishedName", "whenCreated", "whenChanged",
-            "domainFunctionality", "msDS-Behavior-Version", "msDS-MinimumPasswordLength",
-            "msDS-PasswordComplexityEnabled", "msDS-LockoutThreshold", "msDS-LockoutDuration",
-            "msDS-LockoutObservationWindow", "msDS-PasswordHistoryLength"
-        ))
+        # Use the simplest possible method
+        $domainInfo = @{
+            Name = "UNKNOWN"
+            DistinguishedName = ""
+            SID = ""
+            FunctionalLevel = "Unknown"
+        }
         
-        $domainResult = $domainSearch.FindOne()
-        
-        if ($domainResult) {
-            $domainSid = [System.Security.Principal.SecurityIdentifier]::new($domainResult.Properties.objectsid[0], 0).Value
+        # Try to get current domain via .NET
+        try {
+            $currentDomain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
+            $domainInfo.Name = $currentDomain.Name.ToUpper()
+            $domainInfo.DistinguishedName = "DC=" + $domainInfo.Name.Replace(".", ",DC=")
             
-            $adMap.Domain = @{
-                Name = $Connection.DomainName
-                DistinguishedName = $domainResult.Properties.distinguishedname[0]
-                NetBIOSName = $domainResult.Properties.name[0]
-                SID = $domainSid
-                Created = $domainResult.Properties.whenCreated[0]
-                Modified = $domainResult.Properties.whenChanged[0]
-                FunctionalLevel = switch ($domainResult.Properties.domainFunctionality[0]) {
-                    0 { "Windows 2000" }
-                    1 { "Windows Server 2003 Interim" }
-                    2 { "Windows Server 2003" }
-                    3 { "Windows Server 2008" }
-                    4 { "Windows Server 2008 R2" }
-                    5 { "Windows Server 2012" }
-                    6 { "Windows Server 2012 R2" }
-                    7 { "Windows Server 2016" }
-                    8 { "Windows Server 2022" }
-                    default { "Unknown" }
-                }
-                PasswordPolicy = @{
-                    MinLength = if ($domainResult.Properties."msDS-MinimumPasswordLength") { $domainResult.Properties."msDS-MinimumPasswordLength"[0] } else { 7 }
-                    Complexity = if ($domainResult.Properties."msDS-PasswordComplexityEnabled") { [bool]$domainResult.Properties."msDS-PasswordComplexityEnabled"[0] } else { $true }
-                    HistoryLength = if ($domainResult.Properties."msDS-PasswordHistoryLength") { $domainResult.Properties."msDS-PasswordHistoryLength"[0] } else { 24 }
-                    LockoutThreshold = if ($domainResult.Properties."msDS-LockoutThreshold") { $domainResult.Properties."msDS-LockoutThreshold"[0] } else { 0 }
-                    LockoutDuration = if ($domainResult.Properties."msDS-LockoutDuration") { $domainResult.Properties."msDS-LockoutDuration"[0] } else { $null }
-                    LockoutWindow = if ($domainResult.Properties."msDS-LockoutObservationWindow") { $domainResult.Properties."msDS-LockoutObservationWindow"[0] } else { $null }
-                }
+            Write-Host "  [+] Domain: $($domainInfo.Name)" -ForegroundColor Green
+        } catch {
+            Write-Host "  [-] Could not get domain name: $_" -ForegroundColor Yellow
+        }
+        
+        # Try to get domain SID via WMI
+        try {
+            $computerSystem = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction SilentlyContinue
+            if ($computerSystem.Domain) {
+                $domainInfo.Name = $computerSystem.Domain.ToUpper()
             }
             
-            Write-Host "[+] Domain: $($adMap.Domain.Name)" -ForegroundColor Green
-            Write-Host "[+] Functional Level: $($adMap.Domain.FunctionalLevel)" -ForegroundColor Green
-            Write-Host "[+] Password Policy:" -ForegroundColor Gray
-            Write-Host "    - Min Length: $($adMap.Domain.PasswordPolicy.MinLength)" -ForegroundColor Gray
-            Write-Host "    - Complexity: $($adMap.Domain.PasswordPolicy.Complexity)" -ForegroundColor Gray
-            Write-Host "    - Lockout Threshold: $($adMap.Domain.PasswordPolicy.LockoutThreshold)" -ForegroundColor Gray
+            # Try to get SID via local SAM
+            $sid = (Get-WmiObject Win32_UserAccount -Filter "Name='Administrator' and Domain='$($domainInfo.Name)'" -ErrorAction SilentlyContinue).SID
+            if ($sid) {
+                $domainInfo.SID = $sid -replace "-500$", ""
+            }
+        } catch {
+            Write-Host "  [-] Could not get domain SID" -ForegroundColor Yellow
         }
-    }
-    catch {
-        Write-Host "[-] Error getting domain info: $_" -ForegroundColor Yellow
+        
+        return $domainInfo
+    } catch {
+        Write-Host "  [!] Error in Safe-GetDomainInfo: $_" -ForegroundColor Red
+        return @{Name = "ERROR"; DistinguishedName = ""; SID = ""; FunctionalLevel = "Unknown"}
     }
 }
 
-# ==================== FOREST INFO ====================
-function Get-ForestInfo {
-    param($Connection)
+function Safe-GetGroups {
+    param([string]$DomainDN, [string]$Server)
     
-    Write-Host "`n[*] Getting forest information..." -ForegroundColor Green
+    Write-Host "`n[*] Enumerating groups (safe mode)..." -ForegroundColor Green
     
-    try {
-        $forestSearch = [ADSISearcher]"(objectClass=crossRefContainer)"
-        $forestSearch.SearchRoot = [ADSI]"LDAP://$($Connection.Server)/CN=Partitions,$($Connection.ConfigDN)"
-        $forestSearch.PropertiesToLoad.AddRange(@("cn", "dnsRoot", "msDS-NC-Replica-Locations"))
-        
-        $forestResults = $forestSearch.FindAll()
-        
-        $forestDomains = @()
-        $forestSites = @()
-        
-        foreach ($result in $forestResults) {
-            if ($result.Properties.dnsRoot) {
-                $forestDomains += @{
-                    Name = $result.Properties.cn[0]
-                    DNSRoot = $result.Properties.dnsRoot[0]
-                }
-            }
-        }
-        
-        # Get forest functional level
-        $forestRootSearch = [ADSISearcher]"(objectClass=crossRef)"
-        $forestRootSearch.SearchRoot = [ADSI]"LDAP://$($Connection.Server)/CN=Partitions,$($Connection.ConfigDN)"
-        $forestRootSearch.Filter = "(netbiosname=*)"
-        $forestRootSearch.PropertiesToLoad.AddRange(@("msDS-Behavior-Version", "name"))
-        
-        $forestRootResult = $forestRootSearch.FindOne()
-        
-        $adMap.Forest = @{
-            Domains = $forestDomains
-            DomainCount = $forestDomains.Count
-            FunctionalLevel = if ($forestRootResult -and $forestRootResult.Properties."msDS-Behavior-Version") {
-                switch ($forestRootResult.Properties."msDS-Behavior-Version"[0]) {
-                    0 { "Windows 2000" }
-                    1 { "Windows Server 2003" }
-                    2 { "Windows Server 2008" }
-                    3 { "Windows Server 2008 R2" }
-                    4 { "Windows Server 2012" }
-                    5 { "Windows Server 2012 R2" }
-                    6 { "Windows Server 2016" }
-                    7 { "Windows Server 2022" }
-                    default { "Unknown" }
-                }
-            } else { "Unknown" }
-        }
-        
-        Write-Host "[+] Forest has $($forestDomains.Count) domains" -ForegroundColor Green
-        Write-Host "[+] Forest Functional Level: $($adMap.Forest.FunctionalLevel)" -ForegroundColor Green
+    $groups = @{
+        HighValue = @()
+        Builtin = @()
+        AdminCount = @()
+        Regular = @()
     }
-    catch {
-        Write-Host "[-] Error getting forest info: $_" -ForegroundColor Yellow
-    }
-}
-
-# ==================== OUS ====================
-function Get-OUs {
-    param($Connection)
     
-    if (-not $config.CollectOUs) { return }
-    
-    Write-Host "`n[*] Enumerating Organizational Units..." -ForegroundColor Green
-    
-    try {
-        $ouSearch = [ADSISearcher]"(objectClass=organizationalUnit)"
-        $ouSearch.SearchRoot = [ADSI]"LDAP://$($Connection.Server)/$($Connection.DomainDN)"
-        $ouSearch.PageSize = 1000
-        $ouSearch.PropertiesToLoad.AddRange(@(
-            "distinguishedName", "name", "description", "gPLink",
-            "whenCreated", "whenChanged", "objectGUID"
-        ))
-        
-        $ouResults = $ouSearch.FindAll()
-        $count = 0
-        
-        foreach ($result in $ouResults) {
-            if ($global:timeoutReached) { break }
-            
-            $ouInfo = @{
-                Name = $result.Properties.name[0]
-                DistinguishedName = $result.Properties.distinguishedname[0]
-                Description = if ($result.Properties.description) { $result.Properties.description[0] } else { "" }
-                GUID = [System.BitConverter]::ToString($result.Properties.objectguid[0]).Replace("-", "").ToLower()
-                Created = $result.Properties.whenCreated[0]
-                Modified = $result.Properties.whenChanged[0]
-                GPOLinks = @()
-            }
-            
-            # Parse GPO Links
-            if ($result.Properties.gPLink) {
-                $gplink = $result.Properties.gPLink[0]
-                $gpoLinks = $gplink -split '\]\[' | ForEach-Object {
-                    if ($_ -match 'LDAP://CN=({[^}]+}),CN=Policies,CN=System') {
-                        $gpoGuid = $matches[1]
-                        @{
-                            GUID = $gpoGuid
-                            Link = $_
-                        }
-                    }
-                }
-                $ouInfo.GPOLinks = $gpoLinks
-            }
-            
-            $adMap.OUs += $ouInfo
-            $count++
-            
-            if ($count % 100 -eq 0) {
-                Write-Host "  [+] Found $count OUs..." -ForegroundColor Gray
-            }
-        }
-        
-        Write-Host "[+] Total OUs: $count" -ForegroundColor Green
-    }
-    catch {
-        Write-Host "[-] Error enumerating OUs: $_" -ForegroundColor Yellow
-    }
-}
-
-# ==================== GROUPS ====================
-function Get-Groups {
-    param($Connection)
-    
-    if (-not $config.CollectGroups) { return }
-    
-    Write-Host "`n[*] Enumerating groups..." -ForegroundColor Green
-    
-    # High-value groups to check
-    $highValueGroups = @(
+    # Define high-value groups to look for
+    $highValueGroupNames = @(
         "Domain Admins", "Enterprise Admins", "Schema Admins",
         "Administrators", "Account Operators", "Backup Operators",
         "Print Operators", "Server Operators", "Domain Controllers",
-        "Group Policy Creator Owners", "DNS Admins", "DnsAdmins",
-        "Remote Desktop Users", "Hyper-V Administrators",
-        "Certificate Service DCOM Access", "Windows Authorization Access Group",
-        "Pre-Windows 2000 Compatible Access", "Exchange Organization Administrators",
-        "Exchange Server Administrators", "Exchange View-Only Administrators",
-        "SQL Server Administrators", "Azure Admins", "Cloud App Admins"
+        "Group Policy Creator Owners", "DNS Admins", "DnsAdmins"
     )
     
-    # Built-in groups
-    $builtinGroups = @(
-        "Administrators", "Users", "Guests", "Backup Operators",
-        "Replicator", "Power Users", "Network Configuration Operators",
-        "Remote Desktop Users", "Print Operators", "Account Operators",
-        "Server Operators", "Certificate Service DCOM Access",
-        "Cryptographic Operators", "Distributed COM Users", "Event Log Readers",
-        "IIS_IUSRS", "Performance Log Users", "Performance Monitor Users",
-        "Pre-Windows 2000 Compatible Access", "RAS and IAS Servers",
-        "Terminal Server License Servers", "Windows Authorization Access Group"
-    )
+    # Try different methods to get groups
+    $methodsTried = 0
     
+    # Method 1: Try ADSI with simple query
     try {
-        # Get all groups
-        $groupSearch = [ADSISearcher]"(objectClass=group)"
-        $groupSearch.SearchRoot = [ADSI]"LDAP://$($Connection.Server)/$($Connection.DomainDN)"
-        $groupSearch.PageSize = 1000
-        $groupSearch.PropertiesToLoad.AddRange(@(
-            "distinguishedName", "name", "description", "objectSid",
-            "groupType", "adminCount", "member", "whenCreated", "whenChanged"
-        ))
+        Write-Host "  [*] Method 1: ADSI search..." -ForegroundColor Gray
         
-        $groupResults = $groupSearch.FindAll()
-        $totalGroups = 0
-        $highValueCount = 0
-        $adminCountGroups = 0
+        $searcher = New-Object DirectoryServices.DirectorySearcher
+        if ($Server) {
+            $searcher.SearchRoot = New-Object DirectoryServices.DirectoryEntry("LDAP://$Server/$DomainDN")
+        } else {
+            $searcher.SearchRoot = New-Object DirectoryServices.DirectoryEntry("LDAP://$DomainDN")
+        }
         
-        foreach ($result in $groupResults) {
-            if ($global:timeoutReached) { break }
-            
-            $groupSid = [System.Security.Principal.SecurityIdentifier]::new($result.Properties.objectsid[0], 0).Value
-            $groupType = $result.Properties.groupType[0]
+        $searcher.Filter = "(objectClass=group)"
+        $searcher.PageSize = 100
+        $searcher.PropertiesToLoad.Add("name") | Out-Null
+        $searcher.PropertiesToLoad.Add("description") | Out-Null
+        $searcher.PropertiesToLoad.Add("adminCount") | Out-Null
+        
+        $results = $searcher.FindAll()
+        $methodsTried++
+        
+        foreach ($result in $results) {
+            $groupName = $result.Properties["name"][0]
             
             $groupInfo = @{
-                Name = $result.Properties.name[0]
-                DistinguishedName = $result.Properties.distinguishedname[0]
-                Description = if ($result.Properties.description) { $result.Properties.description[0] } else { "" }
-                SID = $groupSid
-                GroupType = switch ($groupType) {
-                    { $_ -band 0x80000000 } { "Security" }
-                    { $_ -band 0x80000001 } { "Global Security" }
-                    { $_ -band 0x80000002 } { "Domain Local Security" }
-                    { $_ -band 0x80000004 } { "Universal Security" }
-                    default { "Distribution" }
-                }
-                Scope = switch ($groupType) {
-                    { $_ -band 0x00000002 } { "Global" }
-                    { $_ -band 0x00000004 } { "Universal" }
-                    { $_ -band 0x00000008 } { "Domain Local" }
-                    default { "Unknown" }
-                }
-                AdminCount = if ($result.Properties.adminCount) { [int]$result.Properties.adminCount[0] } else { 0 }
-                MemberCount = if ($result.Properties.member) { $result.Properties.member.Count } else { 0 }
-                Created = $result.Properties.whenCreated[0]
-                Modified = $result.Properties.whenChanged[0]
+                Name = $groupName
+                Description = if ($result.Properties["description"]) { $result.Properties["description"][0] } else { "" }
+                AdminCount = if ($result.Properties["adminCount"]) { $result.Properties["adminCount"][0] } else { 0 }
             }
             
-            # Categorize groups
-            if ($highValueGroups -contains $groupInfo.Name) {
-                $adMap.Groups.HighValue += $groupInfo
-                $highValueCount++
-            }
-            elseif ($builtinGroups -contains $groupInfo.Name) {
-                $adMap.Groups.Builtin += $groupInfo
-            }
-            elseif ($groupInfo.AdminCount -eq 1) {
-                $adMap.Groups.AdminCount += $groupInfo
-                $adminCountGroups++
-            }
-            elseif ($groupInfo.GroupType -eq "Security") {
-                $adMap.Groups.Security += $groupInfo
-            }
-            else {
-                $adMap.Groups.Distribution += $groupInfo
-            }
-            
-            $totalGroups++
-            
-            if ($totalGroups % 500 -eq 0) {
-                Write-Host "  [+] Processed $totalGroups groups..." -ForegroundColor Gray
+            if ($highValueGroupNames -contains $groupName) {
+                $groups.HighValue += $groupInfo
+            } elseif ($groupInfo.AdminCount -eq 1) {
+                $groups.AdminCount += $groupInfo
+            } else {
+                $groups.Regular += $groupInfo
             }
         }
         
-        Write-Host "[+] Total Groups: $totalGroups" -ForegroundColor Green
-        Write-Host "[+] High-Value Groups: $highValueCount" -ForegroundColor $(if($highValueCount -gt 0){"Yellow"}else{"Green"})
-        Write-Host "[+] AdminCount=1 Groups: $adminCountGroups" -ForegroundColor $(if($adminCountGroups -gt 0){"Yellow"}else{"Green"})
-        
-        # Get nested group relationships
-        if ($config.CollectACLs) {
-            Get-NestedGroups -Connection $Connection
+        Write-Host "    [+] Found $($results.Count) groups via ADSI" -ForegroundColor Green
+    } catch {
+        Write-Host "    [-] ADSI method failed: $_" -ForegroundColor Yellow
+    }
+    
+    # Method 2: Try net commands (fallback)
+    if ($methodsTried -eq 0) {
+        try {
+            Write-Host "  [*] Method 2: NET commands..." -ForegroundColor Gray
+            
+            # Get local groups
+            $localGroups = net localgroup 2>$null | Where-Object { $_ -match "^\*" } | ForEach-Object { $_.Substring(2).Trim() }
+            
+            foreach ($group in $localGroups) {
+                if ($highValueGroupNames -contains $group) {
+                    $groups.Builtin += @{Name = $group; Description = "Built-in local group"}
+                }
+            }
+            
+            Write-Host "    [+] Found $($localGroups.Count) local groups" -ForegroundColor Green
+        } catch {
+            Write-Host "    [-] NET command method failed" -ForegroundColor Yellow
         }
     }
-    catch {
-        Write-Host "[-] Error enumerating groups: $_" -ForegroundColor Yellow
+    
+    # Method 3: Try WMI
+    if ($methodsTried -eq 0) {
+        try {
+            Write-Host "  [*] Method 3: WMI..." -ForegroundColor Gray
+            
+            $wmiGroups = Get-WmiObject -Class Win32_Group -Filter "Domain='$env:USERDOMAIN'" -ErrorAction SilentlyContinue
+            
+            foreach ($group in $wmiGroups) {
+                $groupInfo = @{
+                    Name = $group.Name
+                    Description = $group.Description
+                }
+                
+                if ($highValueGroupNames -contains $group.Name) {
+                    $groups.HighValue += $groupInfo
+                } else {
+                    $groups.Regular += $groupInfo
+                }
+            }
+            
+            Write-Host "    [+] Found $($wmiGroups.Count) groups via WMI" -ForegroundColor Green
+        } catch {
+            Write-Host "    [-] WMI method failed" -ForegroundColor Yellow
+        }
     }
+    
+    Write-Host "  [+] Total groups found: $($groups.HighValue.Count + $groups.Builtin.Count + $groups.AdminCount.Count + $groups.Regular.Count)" -ForegroundColor Green
+    
+    return $groups
 }
 
-# ==================== NESTED GROUPS ====================
-function Get-NestedGroups {
-    param($Connection)
+function Safe-GetOUs {
+    param([string]$DomainDN, [string]$Server)
     
-    Write-Host "[*] Analyzing nested group relationships..." -ForegroundColor Green
+    Write-Host "`n[*] Enumerating OUs (safe mode)..." -ForegroundColor Green
+    
+    $ous = @()
     
     try {
-        $nestedSearch = [ADSISearcher]"(member=*)"
-        $nestedSearch.SearchRoot = [ADSI]"LDAP://$($Connection.Server)/$($Connection.DomainDN)"
-        $nestedSearch.PageSize = 500
-        $nestedSearch.PropertiesToLoad.AddRange(@("distinguishedName", "name", "member"))
+        $searcher = New-Object DirectoryServices.DirectorySearcher
+        if ($Server) {
+            $searcher.SearchRoot = New-Object DirectoryServices.DirectoryEntry("LDAP://$Server/$DomainDN")
+        } else {
+            $searcher.SearchRoot = New-Object DirectoryServices.DirectoryEntry("LDAP://$DomainDN")
+        }
         
-        $nestedResults = $nestedSearch.FindAll()
-        $nestedCount = 0
+        $searcher.Filter = "(objectClass=organizationalUnit)"
+        $searcher.PageSize = 50
+        $searcher.PropertiesToLoad.Add("name") | Out-Null
+        $searcher.PropertiesToLoad.Add("distinguishedName") | Out-Null
         
-        foreach ($result in $nestedResults) {
-            if ($global:timeoutReached) { break }
-            
-            $groupDN = $result.Properties.distinguishedname[0]
-            $groupName = $result.Properties.name[0]
-            
-            foreach ($member in $result.Properties.member) {
-                # Check if member is a group (not user)
-                try {
-                    $memberSearch = [ADSISearcher]"(distinguishedName=$member)"
-                    $memberSearch.SearchRoot = [ADSI]"LDAP://$($Connection.Server)/$($Connection.DomainDN)"
-                    $memberSearch.PropertiesToLoad.Add("objectClass")
-                    
-                    $memberResult = $memberSearch.FindOne()
-                    if ($memberResult -and $memberResult.Properties.objectclass -contains "group") {
-                        $nestedCount++
-                        $adMap.Groups.NestedGroups += @{
-                            ParentGroup = $groupName
-                            ParentDN = $groupDN
-                            ChildGroup = $member
-                        }
-                    }
-                }
-                catch {
-                    # Skip if can't resolve
-                }
+        $results = $searcher.FindAll()
+        
+        foreach ($result in $results) {
+            $ous += @{
+                Name = $result.Properties["name"][0]
+                DistinguishedName = $result.Properties["distinguishedName"][0]
             }
         }
         
-        Write-Host "[+] Nested Group Relationships: $nestedCount" -ForegroundColor Green
+        Write-Host "  [+] Found $($ous.Count) OUs" -ForegroundColor Green
+        
+    } catch {
+        Write-Host "  [-] Could not enumerate OUs: $_" -ForegroundColor Yellow
+        # Create at least a default OU structure
+        $ous = @(
+            @{Name = "Domain Root"; DistinguishedName = $DomainDN},
+            @{Name = "Domain Controllers"; DistinguishedName = "OU=Domain Controllers,$DomainDN"}
+        )
     }
-    catch {
-        Write-Host "[-] Error analyzing nested groups: $_" -ForegroundColor Yellow
-    }
+    
+    return $ous
 }
 
-# ==================== GPOS ====================
-function Get-GPOs {
-    param($Connection)
+function Safe-GetComputers {
+    param([string]$DomainDN, [string]$Server)
     
-    if (-not $config.CollectGPOs) { return }
+    Write-Host "`n[*] Enumerating computers (safe mode)..." -ForegroundColor Green
     
-    Write-Host "`n[*] Enumerating Group Policy Objects..." -ForegroundColor Green
+    $computers = @{
+        DomainControllers = @()
+        Servers = @()
+        Workstations = @()
+    }
     
     try {
-        $gpoSearch = [ADSISearcher]"(objectClass=groupPolicyContainer)"
-        $gpoSearch.SearchRoot = [ADSI]"LDAP://$($Connection.Server)/CN=Policies,CN=System,$($Connection.DomainDN)"
-        $gpoSearch.PageSize = 500
-        $gpoSearch.PropertiesToLoad.AddRange(@(
-            "displayName", "name", "gPCFileSysPath", "gPCFunctionalityVersion",
-            "gPCMachineExtensionNames", "gPCUserExtensionNames", "whenCreated", "whenChanged",
-            "versionNumber", "flags"
-        ))
-        
-        $gpoResults = $gpoSearch.FindAll()
-        $gpoCount = 0
-        
-        foreach ($result in $gpoResults) {
-            if ($global:timeoutReached) { break }
-            
-            $gpoInfo = @{
-                Name = if ($result.Properties.displayName) { $result.Properties.displayName[0] } else { "Unnamed GPO" }
-                GUID = $result.Properties.name[0]
-                SysvolPath = if ($result.Properties.gPCFileSysPath) { $result.Properties.gPCFileSysPath[0] } else { "" }
-                Version = if ($result.Properties.versionNumber) { $result.Properties.versionNumber[0] } else { 0 }
-                Created = $result.Properties.whenCreated[0]
-                Modified = $result.Properties.whenChanged[0]
-                Status = if ($result.Properties.flags -and $result.Properties.flags[0] -eq 1) { "Disabled" } else { "Enabled" }
-                Extensions = @{
-                    Machine = if ($result.Properties.gPCMachineExtensionNames) { $result.Properties.gPCMachineExtensionNames[0] } else { "" }
-                    User = if ($result.Properties.gPCUserExtensionNames) { $result.Properties.gPCUserExtensionNames[0] } else { "" }
-                }
-            }
-            
-            $adMap.GPOs += $gpoInfo
-            $gpoCount++
-            
-            if ($gpoCount % 50 -eq 0) {
-                Write-Host "  [+] Found $gpoCount GPOs..." -ForegroundColor Gray
-            }
+        $searcher = New-Object DirectoryServices.DirectorySearcher
+        if ($Server) {
+            $searcher.SearchRoot = New-Object DirectoryServices.DirectoryEntry("LDAP://$Server/$DomainDN")
+        } else {
+            $searcher.SearchRoot = New-Object DirectoryServices.DirectoryEntry("LDAP://$DomainDN")
         }
         
-        Write-Host "[+] Total GPOs: $gpoCount" -ForegroundColor Green
-    }
-    catch {
-        Write-Host "[-] Error enumerating GPOs: $_" -ForegroundColor Yellow
-    }
-}
-
-# ==================== COMPUTERS ====================
-function Get-Computers {
-    param($Connection)
-    
-    if (-not $config.CollectComputers) { return }
-    
-    Write-Host "`n[*] Enumerating computers..." -ForegroundColor Green
-    
-    try {
-        $computerSearch = [ADSISearcher]"(objectClass=computer)"
-        $computerSearch.SearchRoot = [ADSI]"LDAP://$($Connection.Server)/$($Connection.DomainDN)"
-        $computerSearch.PageSize = 1000
-        $computerSearch.PropertiesToLoad.AddRange(@(
-            "name", "dNSHostName", "operatingSystem", "operatingSystemVersion",
-            "operatingSystemServicePack", "lastLogonTimestamp", "userAccountControl",
-            "description", "managedBy", "ms-MCS-AdmPwd", "ms-MCS-AdmPwdExpirationTime"
-        ))
+        # Just get a sample, not all computers
+        $searcher.Filter = "(objectClass=computer)"
+        $searcher.PageSize = 100
+        $searcher.SizeLimit = 100  # Limit results
+        $searcher.PropertiesToLoad.Add("name") | Out-Null
+        $searcher.PropertiesToLoad.Add("operatingSystem") | Out-Null
         
-        $computerResults = $computerSearch.FindAll()
-        $totalComputers = 0
-        $dcCount = 0
-        $serverCount = 0
-        $lapsCount = 0
+        $results = $searcher.FindAll()
         
-        foreach ($result in $computerResults) {
-            if ($global:timeoutReached) { break }
-            
-            $computerName = $result.Properties.name[0]
-            $os = if ($result.Properties.operatingSystem) { $result.Properties.operatingSystem[0] } else { "" }
-            $uac = if ($result.Properties.userAccountControl) { $result.Properties.userAccountControl[0] } else { 0 }
+        foreach ($result in $results) {
+            $computerName = $result.Properties["name"][0]
+            $os = if ($result.Properties["operatingSystem"]) { $result.Properties["operatingSystem"][0] } else { "" }
             
             $computerInfo = @{
                 Name = $computerName
-                DNSHostName = if ($result.Properties.dNSHostName) { $result.Properties.dNSHostName[0] } else { $computerName }
                 OperatingSystem = $os
-                OSVersion = if ($result.Properties.operatingSystemVersion) { $result.Properties.operatingSystemVersion[0] } else { "" }
-                LastLogon = if ($result.Properties.lastLogonTimestamp) { $result.Properties.lastLogonTimestamp[0] } else { $null }
-                Description = if ($result.Properties.description) { $result.Properties.description[0] } else { "" }
-                ManagedBy = if ($result.Properties.managedBy) { $result.Properties.managedBy[0] } else { "" }
-                IsDomainController = (($uac -band 0x2000) -eq 0x2000)  # SERVER_TRUST_ACCOUNT
-                IsServer = $os -like "*Server*"
-                LAPS = @{
-                    HasLAPS = [bool]($result.Properties."ms-MCS-AdmPwd")
-                    PasswordExpiration = if ($result.Properties."ms-MCS-AdmPwdExpirationTime") { 
-                        [datetime]::FromFileTime([int64]$result.Properties."ms-MCS-AdmPwdExpirationTime"[0])
-                    } else { $null }
-                }
             }
             
-            # Categorize
-            if ($computerInfo.IsDomainController) {
-                $adMap.Computers.DomainControllers += $computerInfo
-                $dcCount++
-            }
-            elseif ($computerInfo.IsServer) {
-                $adMap.Computers.Servers += $computerInfo
-                $serverCount++
-            }
-            else {
-                $adMap.Computers.Workstations += $computerInfo
-            }
-            
-            if ($computerInfo.LAPS.HasLAPS) {
-                $adMap.Computers.LAPSEnabled += $computerInfo
-                $lapsCount++
-            }
-            
-            $totalComputers++
-            
-            if ($totalComputers % 500 -eq 0) {
-                Write-Host "  [+] Processed $totalComputers computers..." -ForegroundColor Gray
+            if ($computerName -like "*DC*" -or $computerName -like "*PDC*") {
+                $computers.DomainControllers += $computerInfo
+            } elseif ($os -like "*Server*") {
+                $computers.Servers += $computerInfo
+            } else {
+                $computers.Workstations += $computerInfo
             }
         }
         
-        Write-Host "[+] Total Computers: $totalComputers" -ForegroundColor Green
-        Write-Host "[+] Domain Controllers: $dcCount" -ForegroundColor $(if($dcCount -gt 0){"Yellow"}else{"White"})
-        Write-Host "[+] Servers: $serverCount" -ForegroundColor White
-        Write-Host "[+] LAPS Enabled: $lapsCount" -ForegroundColor $(if($lapsCount -gt 0){"Green"}else{"White"})
+        Write-Host "  [+] Found $($results.Count) computers (sampled)" -ForegroundColor Green
+        
+    } catch {
+        Write-Host "  [-] Could not enumerate computers: $_" -ForegroundColor Yellow
     }
-    catch {
-        Write-Host "[-] Error enumerating computers: $_" -ForegroundColor Yellow
-    }
+    
+    return $computers
 }
 
-# ==================== TRUSTS ====================
-function Get-Trusts {
-    param($Connection)
+function Safe-GetGPOs {
+    Write-Host "`n[*] Looking for GPOs (safe mode)..." -ForegroundColor Green
     
-    if (-not $config.CollectTrusts) { return }
-    
-    Write-Host "`n[*] Enumerating domain trusts..." -ForegroundColor Green
+    $gpos = @()
     
     try {
-        $trustSearch = [ADSISearcher]"(objectClass=trustedDomain)"
-        $trustSearch.SearchRoot = [ADSI]"LDAP://$($Connection.Server)/$($Connection.DomainDN)"
-        $trustSearch.PropertiesToLoad.AddRange(@(
-            "name", "trustDirection", "trustType", "trustAttributes",
-            "trustPartner", "flatName", "securityIdentifier"
-        ))
+        # Try to get GPOs via GPMC
+        $gpmcAvailable = $false
+        try {
+            $gpm = New-Object -ComObject GPMgmt.GPM
+            $gpmcAvailable = $true
+        } catch { }
         
-        $trustResults = $trustSearch.FindAll()
-        
-        foreach ($result in $trustResults) {
-            $trustInfo = @{
-                Name = $result.Properties.name[0]
-                TrustPartner = if ($result.Properties.trustPartner) { $result.Properties.trustPartner[0] } else { "" }
-                Direction = switch ($result.Properties.trustDirection[0]) {
-                    1 { "Inbound" }
-                    2 { "Outbound" }
-                    3 { "Bidirectional" }
-                    default { "Unknown" }
-                }
-                Type = switch ($result.Properties.trustType[0]) {
-                    1 { "Downlevel (NT4)" }
-                    2 { "Uplevel (AD)" }
-                    3 { "MIT" }
-                    default { "Unknown" }
-                }
-                Attributes = @{
-                    IsForestTrust = [bool]($result.Properties.trustAttributes[0] -band 0x00000020)
-                    IsTransitive = [bool]($result.Properties.trustAttributes[0] -band 0x00000040)
-                    IsQuarantined = [bool]($result.Properties.trustAttributes[0] -band 0x00000004)
-                    UsesRC4 = [bool]($result.Properties.trustAttributes[0] -band 0x00000080)
-                }
-                FlatName = if ($result.Properties.flatName) { $result.Properties.flatName[0] } else { "" }
-                SID = if ($result.Properties.securityIdentifier) { 
-                    [System.Security.Principal.SecurityIdentifier]::new($result.Properties.securityIdentifier[0], 0).Value 
-                } else { "" }
-            }
+        if ($gpmcAvailable) {
+            $domain = $gpm.GetDomain($env:USERDOMAIN, "", $gpm.Constants.UseAnyDC)
+            $gpoList = $domain.SearchGPOs()
             
-            $adMap.Trusts += $trustInfo
+            foreach ($gpo in $gpoList) {
+                $gpos += @{
+                    Name = $gpo.DisplayName
+                    ID = $gpo.ID
+                    Status = if ($gpo.GPOStatus -eq 0) { "Enabled" } else { "Disabled" }
+                }
+            }
+        } else {
+            # Fallback: Check sysvol for GPOs
+            $sysvolPath = "\\$env:USERDNSDOMAIN\SYSVOL\$env:USERDNSDOMAIN\Policies"
+            if (Test-Path $sysvolPath) {
+                $gpoFolders = Get-ChildItem -Path $sysvolPath -Directory | Where-Object { $_.Name -match "^\{[A-F0-9-]+\}$" }
+                
+                foreach ($folder in $gpoFolders) {
+                    $gpos += @{
+                        Name = "GPO_$($folder.Name)"
+                        ID = $folder.Name
+                        Status = "Unknown"
+                    }
+                }
+            }
         }
         
-        Write-Host "[+] Total Trusts: $($adMap.Trusts.Count)" -ForegroundColor Green
+        Write-Host "  [+] Found $($gpos.Count) GPOs" -ForegroundColor Green
+        
+    } catch {
+        Write-Host "  [-] Could not enumerate GPOs: $_" -ForegroundColor Yellow
     }
-    catch {
-        Write-Host "[-] Error enumerating trusts: $_" -ForegroundColor Yellow
-    }
+    
+    return $gpos
 }
 
-# ==================== SITES & SUBNETS ====================
-function Get-SitesAndSubnets {
-    param($Connection)
+function Safe-GetTrusts {
+    Write-Host "`n[*] Looking for domain trusts (safe mode)..." -ForegroundColor Green
     
-    if (-not $config.CollectSites) { return }
-    
-    Write-Host "`n[*] Enumerating AD Sites and Subnets..." -ForegroundColor Green
+    $trusts = @()
     
     try {
-        # Get Sites
-        $siteSearch = [ADSISearcher]"(objectClass=site)"
-        $siteSearch.SearchRoot = [ADSI]"LDAP://$($Connection.Server)/CN=Sites,$($Connection.ConfigDN)"
-        $siteSearch.PropertiesToLoad.AddRange(@("name", "description", "location"))
-        
-        $siteResults = $siteSearch.FindAll()
-        
-        foreach ($result in $siteResults) {
-            $siteInfo = @{
-                Name = $result.Properties.name[0]
-                Description = if ($result.Properties.description) { $result.Properties.description[0] } else { "" }
-                Location = if ($result.Properties.location) { $result.Properties.location[0] } else { "" }
-                Subnets = @()
-            }
+        # Method 1: nltest
+        $nltestOutput = nltest /domain_trusts 2>$null
+        if ($nltestOutput) {
+            $trustDomains = $nltestOutput | Where-Object { $_ -match "^\s+[A-Z]" } | ForEach-Object { $_.Trim() }
             
-            # Get Subnets for this site
-            $subnetSearch = [ADSISearcher]"(objectClass=subnet)"
-            $subnetSearch.SearchRoot = [ADSI]"LDAP://$($Connection.Server)/CN=Subnets,CN=Sites,$($Connection.ConfigDN)"
-            $subnetSearch.Filter = "(siteObject=CN=$($siteInfo.Name),CN=Sites,$($Connection.ConfigDN))"
-            $subnetSearch.PropertiesToLoad.AddRange(@("name", "description", "location"))
-            
-            $subnetResults = $subnetSearch.FindAll()
-            
-            foreach ($subnet in $subnetResults) {
-                $subnetInfo = @{
-                    Name = $subnet.Properties.name[0]  # CIDR notation
-                    Description = if ($subnet.Properties.description) { $subnet.Properties.description[0] } else { "" }
-                    Location = if ($subnet.Properties.location) { $subnet.Properties.location[0] } else { "" }
-                }
-                $siteInfo.Subnets += $subnetInfo
-                $adMap.Subnets += $subnetInfo
-            }
-            
-            $adMap.Sites += $siteInfo
-        }
-        
-        Write-Host "[+] Sites: $($adMap.Sites.Count)" -ForegroundColor Green
-        Write-Host "[+] Subnets: $($adMap.Subnets.Count)" -ForegroundColor Green
-    }
-    catch {
-        Write-Host "[-] Error enumerating sites/subnets: $_" -ForegroundColor Yellow
-    }
-}
-
-# ==================== CERTIFICATE TEMPLATES ====================
-function Get-CertificateTemplates {
-    param($Connection)
-    
-    if (-not $config.CollectCertTemplates) { return }
-    
-    Write-Host "`n[*] Enumerating Certificate Templates..." -ForegroundColor Green
-    
-    try {
-        $certSearch = [ADSISearcher]"(objectClass=pKICertificateTemplate)"
-        $certSearch.SearchRoot = [ADSI]"LDAP://$($Connection.Server)/CN=Certificate Templates,CN=Public Key Services,CN=Services,$($Connection.ConfigDN)"
-        $certSearch.PageSize = 100
-        $certSearch.PropertiesToLoad.AddRange(@(
-            "name", "displayName", "pKIExpirationPeriod", "pKIOverlapPeriod",
-            "pKIDefaultKeySpec", "pKIKeyUsage", "pKIMaxIssuingDepth",
-            "pKICriticalExtensions", "pKIExtendedKeyUsage", "flags"
-        ))
-        
-        $certResults = $certSearch.FindAll()
-        
-        foreach ($result in $certResults) {
-            $certInfo = @{
-                Name = $result.Properties.name[0]
-                DisplayName = if ($result.Properties.displayName) { $result.Properties.displayName[0] } else { "" }
-                ExpirationPeriod = if ($result.Properties.pKIExpirationPeriod) { 
-                    [System.BitConverter]::ToUInt64($result.Properties.pKIExpirationPeriod[0], 0)
-                } else { 0 }
-                KeyUsage = if ($result.Properties.pKIKeyUsage) { $result.Properties.pKIKeyUsage[0] } else { 0 }
-                Flags = if ($result.Properties.flags) { $result.Properties.flags[0] } else { 0 }
-                IsEnrollmentEnabled = [bool]($result.Properties.flags[0] -band 0x00000001)
-                IsAutoEnrollmentEnabled = [bool]($result.Properties.flags[0] -band 0x00000002)
-                IsMachineType = [bool]($result.Properties.flags[0] -band 0x00000004)
-                IsCA = [bool]($result.Properties.flags[0] -band 0x00000008)
-                ExtendedKeyUsage = if ($result.Properties.pKIExtendedKeyUsage) { $result.Properties.pKIExtendedKeyUsage } else { @() }
-            }
-            
-            $adMap.CertificateTemplates += $certInfo
-        }
-        
-        Write-Host "[+] Certificate Templates: $($adMap.CertificateTemplates.Count)" -ForegroundColor Green
-    }
-    catch {
-        Write-Host "[-] Error enumerating certificate templates: $_" -ForegroundColor Yellow
-    }
-}
-
-# ==================== SERVICE ACCOUNTS ====================
-function Get-ServiceAccounts {
-    param($Connection)
-    
-    if (-not $config.CollectServiceAccounts) { return }
-    
-    Write-Host "`n[*] Looking for service accounts..." -ForegroundColor Green
-    
-    try {
-        # gMSA accounts
-        $gmsaSearch = [ADSISearcher]"(objectClass=msDS-GroupManagedServiceAccount)"
-        $gmsaSearch.SearchRoot = [ADSI]"LDAP://$($Connection.Server)/$($Connection.DomainDN)"
-        $gmsaSearch.PropertiesToLoad.AddRange(@(
-            "samAccountName", "distinguishedName", "msDS-ManagedPasswordInterval",
-            "msDS-GroupMSAMembership", "msDS-HostServiceAccountBL"
-        ))
-        
-        $gmsaResults = $gmsaSearch.FindAll()
-        
-        foreach ($gmsa in $gmsaResults) {
-            $adMap.ServiceAccounts += @{
-                Type = "gMSA"
-                Name = $gmsa.Properties.samAccountName[0]
-                DistinguishedName = $gmsa.Properties.distinguishedName[0]
-                PasswordInterval = if ($gmsa.Properties."msDS-ManagedPasswordInterval") { 
-                    $gmsa.Properties."msDS-ManagedPasswordInterval"[0] 
-                } else { 30 }
-                AllowedPrincipals = if ($gmsa.Properties."msDS-GroupMSAMembership") { 
-                    $gmsa.Properties."msDS-GroupMSAMembership"
-                } else { @() }
-            }
-        }
-        
-        # Regular service accounts (names ending with $ but not computers)
-        $svcSearch = [ADSISearcher]"(samAccountName=*$)"
-        $svcSearch.SearchRoot = [ADSI]"LDAP://$($Connection.Server)/$($Connection.DomainDN)"
-        $svcSearch.PageSize = 500
-        $svcSearch.PropertiesToLoad.AddRange(@("samAccountName", "distinguishedName", "description", "servicePrincipalName"))
-        
-        $svcResults = $svcSearch.FindAll()
-        
-        foreach ($svc in $svcResults) {
-            $name = $svc.Properties.samAccountName[0]
-            # Filter out computer accounts
-            if ($name -notmatch "^[A-Za-z0-9]+$$" -or $name -match "\$\$$") {
-                $adMap.ServiceAccounts += @{
-                    Type = "ServiceAccount"
-                    Name = $name
-                    DistinguishedName = $svc.Properties.distinguishedName[0]
-                    Description = if ($svc.Properties.description) { $svc.Properties.description[0] } else { "" }
-                    SPNs = if ($svc.Properties.servicePrincipalName) { $svc.Properties.servicePrincipalName } else { @() }
+            foreach ($domain in $trustDomains) {
+                if ($domain -ne $env:USERDOMAIN) {
+                    $trusts += @{
+                        Name = $domain
+                        Direction = "Unknown"
+                        Type = "Unknown"
+                    }
                 }
             }
         }
         
-        Write-Host "[+] Service Accounts: $($adMap.ServiceAccounts.Count)" -ForegroundColor Green
+        # Method 2: .NET Domain
+        if ($trusts.Count -eq 0) {
+            try {
+                $currentDomain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
+                $domainTrusts = $currentDomain.GetAllTrustRelationships()
+                
+                foreach ($trust in $domainTrusts) {
+                    $trusts += @{
+                        Name = $trust.TargetName
+                        Direction = $trust.TrustDirection.ToString()
+                        Type = $trust.TrustType.ToString()
+                    }
+                }
+            } catch { }
+        }
+        
+        Write-Host "  [+] Found $($trusts.Count) domain trusts" -ForegroundColor Green
+        
+    } catch {
+        Write-Host "  [-] Could not enumerate trusts" -ForegroundColor Yellow
     }
-    catch {
-        Write-Host "[-] Error enumerating service accounts: $_" -ForegroundColor Yellow
+    
+    return $trusts
+}
+
+function Safe-GetServiceAccounts {
+    Write-Host "`n[*] Looking for service accounts (safe mode)..." -ForegroundColor Green
+    
+    $serviceAccounts = @()
+    
+    try {
+        # Look for common service account patterns
+        $patterns = @("*svc*", "*service*", "*app*", "*sql*", "*iis*", "*exchange*", "*sharepoint*")
+        
+        foreach ($pattern in $patterns) {
+            try {
+                $searcher = New-Object DirectoryServices.DirectorySearcher
+                $searcher.SearchRoot = New-Object DirectoryServices.DirectoryEntry
+                $searcher.Filter = "(&(objectClass=user)(samAccountName=$pattern))"
+                $searcher.PageSize = 20
+                $searcher.PropertiesToLoad.Add("samAccountName") | Out-Null
+                $searcher.PropertiesToLoad.Add("description") | Out-Null
+                
+                $results = $searcher.FindAll()
+                
+                foreach ($result in $results) {
+                    $serviceAccounts += @{
+                        Name = $result.Properties["samAccountName"][0]
+                        Description = if ($result.Properties["description"]) { $result.Properties["description"][0] } else { "" }
+                        Type = "ServiceAccount"
+                    }
+                }
+            } catch { }
+        }
+        
+        # Remove duplicates
+        $serviceAccounts = $serviceAccounts | Sort-Object -Property Name -Unique
+        
+        Write-Host "  [+] Found $($serviceAccounts.Count) potential service accounts" -ForegroundColor Green
+        
+    } catch {
+        Write-Host "  [-] Could not enumerate service accounts" -ForegroundColor Yellow
     }
+    
+    return $serviceAccounts
 }
 
 # ==================== MAIN EXECUTION ====================
 try {
-    Write-Host "[*] Starting AD Mapper..." -ForegroundColor Green
-    Write-Host "[*] Timeout set to: $Timeout seconds" -ForegroundColor Gray
+    Write-Host "[*] Starting AD Structure Mapper (Resilient Mode)" -ForegroundColor Green
+    Write-Host "[*] Parameters:" -ForegroundColor Gray
+    Write-Host "    - DomainController: $(if($DomainController){$DomainController}else{'Auto-detect'})" -ForegroundColor Gray
+    Write-Host "    - OutputPath: $OutputPath" -ForegroundColor Gray
+    Write-Host "    - UseIPAddress: $UseIPAddress" -ForegroundColor Gray
+    Write-Host "    - Timeout: $Timeout seconds" -ForegroundColor Gray
     
     # Test connection
-    $connection = Test-Connection
+    $connection = Test-LDAPConnection -Server $DomainController -UseIP:$UseIPAddress -SkipDNS:$NoDNS
     
-    # Start collection
-    Get-DomainInfo -Connection $connection
-    Get-ForestInfo -Connection $connection
-    Get-OUs -Connection $connection
-    Get-Groups -Connection $connection
-    Get-GPOs -Connection $connection
-    Get-Computers -Connection $connection
-    Get-Trusts -Connection $connection
-    Get-SitesAndSubnets -Connection $connection
-    Get-CertificateTemplates -Connection $connection
-    Get-ServiceAccounts -Connection $connection
+    if (-not $connection) {
+        Write-Host "`n[!] WARNING: Could not establish LDAP connection." -ForegroundColor Red
+        Write-Host "[*] Switching to fallback mode using available methods..." -ForegroundColor Yellow
+    }
     
-    # Stop timeout timer
-    $timeoutTimer.Stop()
-    Unregister-Event -SourceIdentifier TimeoutReached -ErrorAction SilentlyContinue
+    # Get basic domain info
+    $domainInfo = Safe-GetDomainInfo
+    
+    # Collect data using safe methods
+    Write-Host "`n[*] Collecting AD structure data..." -ForegroundColor Green
+    
+    $adStructure = @{
+        Metadata = @{
+            CollectionTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            Collector = "ADStructureMapper v2.0"
+            DomainController = if ($connection -and $connection.Server) { $connection.Server } else { "Unknown" }
+            ExecutionContext = @{
+                User = "$env:USERDOMAIN\$env:USERNAME"
+                Computer = $env:COMPUTERNAME
+                OS = [System.Environment]::OSVersion.VersionString
+            }
+        }
+        Domain = $domainInfo
+        Groups = Safe-GetGroups -DomainDN $domainInfo.DistinguishedName -Server $domainInfo.Name
+        OUs = Safe-GetOUs -DomainDN $domainInfo.DistinguishedName -Server $domainInfo.Name
+        Computers = Safe-GetComputers -DomainDN $domainInfo.DistinguishedName -Server $domainInfo.Name
+        GPOs = Safe-GetGPOs
+        Trusts = Safe-GetTrusts
+        ServiceAccounts = Safe-GetServiceAccounts
+        Findings = @()
+    }
     
     # Calculate statistics
-    $endTime = Get-Date
-    $duration = $endTime - $startTime
+    $totalGroups = $adStructure.Groups.HighValue.Count + $adStructure.Groups.Builtin.Count + 
+                   $adStructure.Groups.AdminCount.Count + $adStructure.Groups.Regular.Count
     
-    $adMap.Statistics = @{
-        CollectionDuration = $duration.ToString("hh\:mm\:ss")
-        OUs = $adMap.OUs.Count
-        Groups = @{
-            Total = $adMap.Groups.Builtin.Count + $adMap.Groups.Security.Count + $adMap.Groups.Distribution.Count
-            HighValue = $adMap.Groups.HighValue.Count
-            AdminCount = $adMap.Groups.AdminCount.Count
-            Nested = $adMap.Groups.NestedGroups.Count
+    $totalComputers = $adStructure.Computers.DomainControllers.Count + 
+                      $adStructure.Computers.Servers.Count + 
+                      $adStructure.Computers.Workstations.Count
+    
+    $adStructure.Statistics = @{
+        TotalGroups = $totalGroups
+        TotalOUs = $adStructure.OUs.Count
+        TotalComputers = $totalComputers
+        TotalGPOs = $adStructure.GPOs.Count
+        TotalTrusts = $adStructure.Trusts.Count
+        TotalServiceAccounts = $adStructure.ServiceAccounts.Count
+        HighValueGroups = $adStructure.Groups.HighValue.Count
+        DomainControllers = $adStructure.Computers.DomainControllers.Count
+    }
+    
+    # Identify critical findings
+    if ($adStructure.Groups.HighValue.Count -gt 0) {
+        $adStructure.Findings += @{
+            Severity = "High"
+            Type = "HighValueGroups"
+            Description = "Found $($adStructure.Groups.HighValue.Count) high-value groups"
+            Groups = $adStructure.Groups.HighValue.Name
         }
-        GPOs = $adMap.GPOs.Count
-        Computers = @{
-            Total = $adMap.Computers.DomainControllers.Count + $adMap.Computers.Servers.Count + $adMap.Computers.Workstations.Count
-            DomainControllers = $adMap.Computers.DomainControllers.Count
-            Servers = $adMap.Computers.Servers.Count
-            LAPSEnabled = $adMap.Computers.LAPSEnabled.Count
+    }
+    
+    if ($adStructure.Computers.DomainControllers.Count -gt 0) {
+        $adStructure.Findings += @{
+            Severity = "High"
+            Type = "DomainControllers"
+            Description = "Found $($adStructure.Computers.DomainControllers.Count) domain controllers"
+            DCs = $adStructure.Computers.DomainControllers.Name
         }
-        Trusts = $adMap.Trusts.Count
-        Sites = $adMap.Sites.Count
-        Subnets = $adMap.Subnets.Count
-        CertificateTemplates = $adMap.CertificateTemplates.Count
-        ServiceAccounts = $adMap.ServiceAccounts.Count
-        TimeoutReached = $global:timeoutReached
     }
     
     # Save results
     Write-Host "`n[*] Saving results to: $OutputPath" -ForegroundColor Green
-    $adMap | ConvertTo-Json -Depth 10 | Out-File -FilePath $OutputPath -Encoding UTF8
+    
+    $json = $adStructure | ConvertTo-Json -Depth 10
+    $json | Out-File -FilePath $OutputPath -Encoding UTF8
     
     # Create summary report
     $summaryPath = $OutputPath -replace "\.json$", "_summary.txt"
-    Create-SummaryReport -Map $adMap -Path $summaryPath
     
-    # Display summary
-    Display-Summary -Map $adMap -Duration $duration
-    
-}
-catch {
-    Write-Host "`n[!] FATAL ERROR: $_" -ForegroundColor Red
-    Write-Host "Stack Trace: $($_.Exception.StackTrace)" -ForegroundColor DarkRed
-}
-finally {
-    # Cleanup
-    $timeoutTimer.Stop()
-    $timeoutTimer.Dispose()
-}
-
-# ==================== HELPER FUNCTIONS ====================
-function Create-SummaryReport {
-    param($Map, $Path)
-    
-    $report = @"
-Active Directory Complete Map - Summary Report
+    $summary = @"
+AD STRUCTURE MAPPING - SUMMARY REPORT
 ===============================================================
 Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-Domain: $($Map.Domain.Name)
-Domain Controller: $($Map.Meta.DomainController)
-Collection Duration: $($Map.Statistics.CollectionDuration)
+Domain: $($adStructure.Domain.Name)
+Collector: $($adStructure.Metadata.Collector)
+User: $($adStructure.Metadata.ExecutionContext.User)
 
-DOMAIN INFORMATION:
-  Domain Name: $($Map.Domain.Name)
-  Domain SID: $($Map.Domain.SID)
-  Functional Level: $($Map.Domain.FunctionalLevel)
-  Password Policy:
-    - Minimum Length: $($Map.Domain.PasswordPolicy.MinLength)
-    - Complexity Required: $($Map.Domain.PasswordPolicy.Complexity)
-    - Lockout Threshold: $($Map.Domain.PasswordPolicy.LockoutThreshold)
+CONNECTION STATUS:
+  Domain Controller: $($adStructure.Metadata.DomainController)
+  Connection Method: $(if($connection){"Successful"}else{"Fallback Mode"})
 
-FOREST INFORMATION:
-  Forest Functional Level: $($Map.Forest.FunctionalLevel)
-  Total Domains in Forest: $($Map.Forest.DomainCount)
-
-ORGANIZATIONAL UNITS:
-  Total OUs: $($Map.Statistics.OUs)
-  OUs with GPO Links: $(($Map.OUs | Where-Object { $_.GPOLinks.Count -gt 0 }).Count)
-
-GROUPS:
-  Total Groups: $($Map.Statistics.Groups.Total)
-  High-Value Groups: $($Map.Statistics.Groups.HighValue)
-  AdminCount=1 Groups: $($Map.Statistics.Groups.AdminCount)
-  Nested Group Relationships: $($Map.Statistics.Groups.Nested)
-
-GROUP POLICY OBJECTS:
-  Total GPOs: $($Map.Statistics.GPOs)
-  Enabled GPOs: $(($Map.GPOs | Where-Object { $_.Status -eq "Enabled" }).Count)
-
-COMPUTERS:
-  Total Computers: $($Map.Statistics.Computers.Total)
-  Domain Controllers: $($Map.Statistics.Computers.DomainControllers)
-  Servers: $($Map.Statistics.Computers.Servers)
-  Computers with LAPS: $($Map.Statistics.Computers.LAPSEnabled)
-
-TRUSTS:
-  Total Trusts: $($Map.Statistics.Trusts)
-  Bidirectional: $(($Map.Trusts | Where-Object { $_.Direction -eq "Bidirectional" }).Count)
-  Forest Trusts: $(($Map.Trusts | Where-Object { $_.Attributes.IsForestTrust }).Count)
-
-SITES & SUBNETS:
-  Sites: $($Map.Statistics.Sites)
-  Subnets: $($Map.Statistics.Subnets)
-
-CERTIFICATE TEMPLATES:
-  Total Templates: $($Map.Statistics.CertificateTemplates)
-  Enrollment Enabled: $(($Map.CertificateTemplates | Where-Object { $_.IsEnrollmentEnabled }).Count)
-
-SERVICE ACCOUNTS:
-  Total Service Accounts: $($Map.Statistics.ServiceAccounts)
-  gMSA Accounts: $(($Map.ServiceAccounts | Where-Object { $_.Type -eq "gMSA" }).Count)
+SUMMARY STATISTICS:
+  Domain: $($adStructure.Domain.Name)
+  Domain Functional Level: $($adStructure.Domain.FunctionalLevel)
+  
+  Groups: $totalGroups
+    - High-Value Groups: $($adStructure.Groups.HighValue.Count)
+    - Built-in Groups: $($adStructure.Groups.Builtin.Count)
+    - AdminCount=1 Groups: $($adStructure.Groups.AdminCount.Count)
+  
+  Organizational Units: $($adStructure.OUs.Count)
+  
+  Computers: $totalComputers
+    - Domain Controllers: $($adStructure.Computers.DomainControllers.Count)
+    - Servers: $($adStructure.Computers.Servers.Count)
+    - Workstations: $($adStructure.Computers.Workstations.Count)
+  
+  Group Policy Objects: $($adStructure.GPOs.Count)
+  
+  Domain Trusts: $($adStructure.Trusts.Count)
+  
+  Service Accounts: $($adStructure.ServiceAccounts.Count)
 
 CRITICAL FINDINGS:
-$($(if ($Map.Statistics.Groups.HighValue -gt 0) {
-  "  - Found $($Map.Statistics.Groups.HighValue) high-value groups (Domain Admins, etc.)"
-}))
-$($(if ($Map.Statistics.Computers.DomainControllers -gt 0) {
-  "  - Found $($Map.Statistics.Computers.DomainControllers) domain controllers"
-}))
-$($(if ($Map.Statistics.Computers.LAPSEnabled -gt 0) {
-  "  - Found $($Map.Statistics.Computers.LAPSEnabled) computers with LAPS enabled"
-}))
+$(
+    if ($adStructure.Findings.Count -gt 0) {
+        foreach ($finding in $adStructure.Findings) {
+            "  [$($finding.Severity)] $($finding.Description)"
+            if ($finding.Groups) {
+                foreach ($group in $finding.Groups) {
+                    "      - $group"
+                }
+            }
+            if ($finding.DCs) {
+                foreach ($dc in $finding.DCs) {
+                    "      - $dc"
+                }
+            }
+        }
+    } else {
+        "  No critical findings identified."
+    }
+)
 
 NOTES:
+- This report was generated in resilient mode
+- Some data may be limited due to permissions or connectivity
 - Complete data saved to: $OutputPath
-- This report includes structure and configuration only (no user details)
-- Use for authorized penetration testing and security assessments only
+- Use for authorized security assessments only
+
+RECOMMENDATIONS:
+1. Review high-value group memberships
+2. Check Domain Controller security configurations
+3. Review service account permissions
+4. Analyze trust relationships for attack paths
 "@
     
-    $report | Out-File -FilePath $Path -Encoding UTF8
-}
-
-function Display-Summary {
-    param($Map, $Duration)
+    $summary | Out-File -FilePath $summaryPath -Encoding UTF8
+    
+    # Display final summary
+    $endTime = Get-Date
+    $duration = $endTime - $startTime
     
     Write-Host "`n" + ("=" * 70) -ForegroundColor Cyan
-    Write-Host " AD MAPPING COMPLETE" -ForegroundColor Green
+    Write-Host " AD STRUCTURE MAPPING COMPLETE" -ForegroundColor Green
     Write-Host "=" * 70 -ForegroundColor Cyan
     
-    Write-Host "Collection Time: $($Duration.ToString('hh\:mm\:ss'))" -ForegroundColor White
-    Write-Host "Domain: $($Map.Domain.Name)" -ForegroundColor White
-    Write-Host "Output File: $OutputPath" -ForegroundColor Green
+    Write-Host "Collection Time: $($duration.ToString('mm\:ss'))" -ForegroundColor White
+    Write-Host "Domain: $($adStructure.Domain.Name)" -ForegroundColor White
+    Write-Host "Mode: $(if($connection){'Full Access'}else{'Fallback'})" -ForegroundColor $(if($connection){'Green'}else{'Yellow'})
     
-    Write-Host "`nSUMMARY STATISTICS:" -ForegroundColor Yellow
-    Write-Host "  OUs: $($Map.Statistics.OUs)" -ForegroundColor White
-    Write-Host "  Groups: $($Map.Statistics.Groups.Total)" -ForegroundColor White
-    Write-Host "  High-Value Groups: $($Map.Statistics.Groups.HighValue)" -ForegroundColor $(if($Map.Statistics.Groups.HighValue -gt 0){"Red"}else{"Green"})
-    Write-Host "  GPOs: $($Map.Statistics.GPOs)" -ForegroundColor White
-    Write-Host "  Computers: $($Map.Statistics.Computers.Total)" -ForegroundColor White
-    Write-Host "  Domain Controllers: $($Map.Statistics.Computers.DomainControllers)" -ForegroundColor $(if($Map.Statistics.Computers.DomainControllers -gt 0){"Yellow"}else{"White"})
-    Write-Host "  Trusts: $($Map.Statistics.Trusts)" -ForegroundColor White
-    Write-Host "  Sites: $($Map.Statistics.Sites)" -ForegroundColor White
-    Write-Host "  Subnets: $($Map.Statistics.Subnets)" -ForegroundColor White
-    Write-Host "  Certificate Templates: $($Map.Statistics.CertificateTemplates)" -ForegroundColor White
-    Write-Host "  Service Accounts: $($Map.Statistics.ServiceAccounts)" -ForegroundColor White
+    Write-Host "`nRESULTS SUMMARY:" -ForegroundColor Yellow
+    Write-Host "  High-Value Groups: $($adStructure.Groups.HighValue.Count)" -ForegroundColor $(if($adStructure.Groups.HighValue.Count -gt 0){'Red'}else{'Green'})
+    Write-Host "  Domain Controllers: $($adStructure.Computers.DomainControllers.Count)" -ForegroundColor $(if($adStructure.Computers.DomainControllers.Count -gt 0){'Yellow'}else{'White'})
+    Write-Host "  OUs: $($adStructure.OUs.Count)" -ForegroundColor White
+    Write-Host "  Total Groups: $totalGroups" -ForegroundColor White
+    Write-Host "  GPOs: $($adStructure.GPOs.Count)" -ForegroundColor White
+    Write-Host "  Trusts: $($adStructure.Trusts.Count)" -ForegroundColor White
     
-    if ($Map.Statistics.TimeoutReached) {
-        Write-Host "`n[!] WARNING: Timeout reached! Some data may be incomplete." -ForegroundColor Red
-        Write-Host "    Consider increasing timeout with -Timeout parameter." -ForegroundColor Yellow
-    }
+    Write-Host "`nOUTPUT FILES:" -ForegroundColor Green
+    Write-Host "  Complete Data: $OutputPath" -ForegroundColor White
+    Write-Host "  Summary Report: $summaryPath" -ForegroundColor White
     
-    Write-Host "`n[+] Summary report saved to: $($OutputPath -replace '\.json$', '_summary.txt')" -ForegroundColor Green
-    Write-Host "[+] Complete JSON data saved to: $OutputPath" -ForegroundColor Green
-    Write-Host "`n[+] You can now analyze the AD structure for security assessment." -ForegroundColor Cyan
+    Write-Host "`n[+] Mapping completed successfully!" -ForegroundColor Green
+    
+} catch {
+    Write-Host "`n[!] UNEXPECTED ERROR: $_" -ForegroundColor Red
+    Write-Host "[!] Please report this error with the following details:" -ForegroundColor Yellow
+    Write-Host "    - Error: $($_.Exception.Message)" -ForegroundColor White
+    Write-Host "    - Line: $($_.InvocationInfo.ScriptLineNumber)" -ForegroundColor White
+    Write-Host "    - Command: $($_.InvocationInfo.Line)" -ForegroundColor White
 }
