@@ -1,533 +1,446 @@
-# Save as DomainShareScanner.ps1
+# Save as SimpleShareScanner.ps1
 param(
     [Parameter(Mandatory=$true)]
     [string]$DomainController,
     
-    [string]$OutputPath = "domain_shares.json",
-    [switch]$QuickScan,
-    [switch]$DeepScan,
-    [int]$MaxComputers = 100
+    [string]$OutputPath = "shares_results.json",
+    [switch]$TestOnly,
+    [switch]$UseNetBIOS
 )
 
-$ErrorActionPreference = "Continue"
 $startTime = Get-Date
 
 Write-Host @"
 ===============================================================
-   ____                _        ____  _               
-  / __ \ ___  _ __ ___| |__    / __ \| |              
- / / _' / _ \| '__/ __| '_ \  / / _' | |__   ___ _ __ 
-| | (_| (_) | | | (__| | | |/ / (_| | '_ \ / _ \ '__|
- \ \__,_\___/|_|  \___|_| |_/_/ \__,_|_.__/ \___|_|   
-  \____/                                              
-        Targeted Domain Share Scanner
+    ____  _                           
+   / __ \(_)___  ____  ___  __________
+  / /_/ / / __ \/ __ \/ _ \/ ___/ ___/
+ / ____/ / /_/ / /_/ /  __/ /  (__  ) 
+/_/   /_/\____/ .___/\___/_/  /____/  
+             /_/                      
+    Simple Targeted Share Scanner
 ===============================================================
 "@ -ForegroundColor Cyan
 
-# ==================== TARGETED FUNCTIONS ====================
-function Get-TargetedComputers {
+# ==================== SIMPLE CONNECTION TEST ====================
+function Test-SimpleConnection {
     param([string]$DCName)
     
-    Write-Host "[*] Getting computers from domain controller: $DCName" -ForegroundColor Green
+    Write-Host "[*] Testing connection to: $DCName" -ForegroundColor Yellow
     
-    $computers = @()
+    # Remove any leading/trailing spaces
+    $DCName = $DCName.Trim()
     
+    # Try multiple connection methods
+    $methods = @(
+        @{Name="Ping Test"; Action={ Test-Connection -ComputerName $DCName -Count 1 -Quiet }},
+        @{Name="LDAP Port 389"; Action={ 
+            try { 
+                $socket = New-Object System.Net.Sockets.TcpClient
+                $socket.Connect($DCName, 389)
+                $socket.Close()
+                $true
+            } catch { $false }
+        }},
+        @{Name="LDAPS Port 636"; Action={ 
+            try { 
+                $socket = New-Object System.Net.Sockets.TcpClient
+                $socket.Connect($DCName, 636)
+                $socket.Close()
+                $true
+            } catch { $false }
+        }},
+        @{Name="NetBIOS (Port 445)"; Action={ 
+            try { 
+                $socket = New-Object System.Net.Sockets.TcpClient
+                $socket.Connect($DCName, 445)
+                $socket.Close()
+                $true
+            } catch { $false }
+        }}
+    )
+    
+    $results = @()
+    foreach ($method in $methods) {
+        try {
+            $success = & $method.Action
+            $results += "$($method.Name): $(if($success){'SUCCESS'}else{'FAILED'})"
+            Write-Host "  [$($method.Name)]: $(if($success){'✓' -f 'Green'}else{'✗' -f 'Red'})" -ForegroundColor $(if($success){'Green'}else{'DarkYellow'})
+        } catch {
+            $results += "$($method.Name): ERROR - $_"
+            Write-Host "  [$($method.Name)]: ERROR" -ForegroundColor Red
+        }
+    }
+    
+    # Try to get domain info
+    $domainInfo = $null
     try {
-        # First, get the domain DN from the DC
+        Write-Host "  [*] Getting domain info..." -ForegroundColor Gray
         $rootDSE = [ADSI]"LDAP://$DCName/RootDSE"
         $domainDN = $rootDSE.defaultNamingContext
         $domainName = ($domainDN -replace 'DC=','' -replace ',','.' -replace 'DC=','').ToUpper()
         
+        $domainInfo = @{
+            DomainName = $domainName
+            DomainDN = $domainDN
+            ServerName = $rootDSE.dnsHostName
+        }
+        
         Write-Host "  [+] Domain: $domainName" -ForegroundColor Green
-        Write-Host "  [+] Domain DN: $domainDN" -ForegroundColor Gray
+        Write-Host "  [+] Server: $($rootDSE.dnsHostName)" -ForegroundColor Green
         
-        # Now query computers from that domain via the specified DC
-        $searcher = New-Object DirectoryServices.DirectorySearcher
-        $searcher.SearchRoot = [ADSI]"LDAP://$DCName/$domainDN"
-        $searcher.Filter = "(objectClass=computer)"
-        $searcher.PageSize = 1000
-        $searcher.PropertiesToLoad.Add("dNSHostName") | Out-Null
-        $searcher.PropertiesToLoad.Add("name") | Out-Null
-        $searcher.PropertiesToLoad.Add("operatingSystem") | Out-Null
+    } catch {
+        Write-Host "  [-] Could not get domain info: $_" -ForegroundColor Yellow
         
-        $results = $searcher.FindAll()
+        # Try to infer domain from DC name
+        if ($DCName -match '\.') {
+            $parts = $DCName -split '\.'
+            if ($parts.Count -ge 2) {
+                $inferredDomain = ($parts[1..($parts.Count-1)] -join '.').ToUpper()
+                $domainInfo = @{
+                    DomainName = $inferredDomain
+                    DomainDN = "DC=" + ($inferredDomain -replace '\.', ',DC=')
+                    ServerName = $DCName
+                }
+                Write-Host "  [*] Inferred domain: $inferredDomain" -ForegroundColor Yellow
+            }
+        }
+    }
+    
+    return @{
+        DCName = $DCName
+        DomainInfo = $domainInfo
+        ConnectionTests = $results
+        Success = ($domainInfo -ne $null)
+    }
+}
+
+# ==================== SIMPLE COMPUTER DISCOVERY ====================
+function Get-ComputersSimple {
+    param([string]$DCName, [string]$DomainName, [switch]$UseNetBIOSMode)
+    
+    Write-Host "`n[*] Discovering computers in domain: $DomainName" -ForegroundColor Green
+    
+    $computers = @()
+    
+    # Method 1: Use net view (works without special permissions)
+    try {
+        Write-Host "  [*] Using net view to discover computers..." -ForegroundColor Gray
         
-        Write-Host "  [*] Querying computers via LDAP://$DCName/$domainDN" -ForegroundColor Gray
+        if ($UseNetBIOSMode) {
+            # Extract NetBIOS name if DC is in FQDN format
+            $netbiosName = $DCName.Split('.')[0]
+            $netViewOutput = net view /domain:$netbiosName 2>$null
+        } else {
+            $netViewOutput = net view /domain:$DomainName 2>$null
+        }
         
-        foreach ($result in $results) {
-            $computerName = if ($result.Properties["dNSHostName"]) { 
-                $result.Properties["dNSHostName"][0] 
-            } else { 
-                if ($result.Properties["name"]) { 
-                    $result.Properties["name"][0] + "." + $domainName.ToLower()
-                } else {
-                    continue
+        if ($netViewOutput) {
+            $computerNames = $netViewOutput | Where-Object { $_ -match '\\\\' } | ForEach-Object { 
+                $_.Trim() -replace '\\\\', '' 
+            }
+            
+            foreach ($name in $computerNames) {
+                $computers += @{
+                    Name = $name
+                    DNSHostName = if ($name -notmatch '\.') { "$name.$DomainName".ToLower() } else { $name }
+                    Type = "Unknown"
                 }
             }
             
-            $os = if ($result.Properties["operatingSystem"]) { 
-                $result.Properties["operatingSystem"][0] 
-            } else { 
-                "Unknown" 
+            Write-Host "  [+] Found $($computers.Count) computers via net view" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "  [-] net view failed: $_" -ForegroundColor Yellow
+    }
+    
+    # Method 2: Try AD query (if we have permission)
+    if ($computers.Count -eq 0) {
+        try {
+            Write-Host "  [*] Trying AD query..." -ForegroundColor Gray
+            
+            $searcher = New-Object DirectoryServices.DirectorySearcher
+            $searcher.Filter = "(objectClass=computer)"
+            $searcher.PageSize = 100
+            $searcher.PropertiesToLoad.Add("name") | Out-Null
+            $searcher.PropertiesToLoad.Add("dNSHostName") | Out-Null
+            
+            $results = $searcher.FindAll()
+            
+            foreach ($result in $results) {
+                $name = $result.Properties["name"][0]
+                $dnsName = if ($result.Properties["dNSHostName"]) { 
+                    $result.Properties["dNSHostName"][0] 
+                } else { 
+                    "$name.$DomainName".ToLower() 
+                }
+                
+                $computers += @{
+                    Name = $name
+                    DNSHostName = $dnsName
+                    Type = "AD Computer"
+                }
             }
             
+            Write-Host "  [+] Found $($computers.Count) computers via AD query" -ForegroundColor Green
+            
+        } catch {
+            Write-Host "  [-] AD query failed: $_" -ForegroundColor Yellow
+        }
+    }
+    
+    # If still no computers, create some common targets
+    if ($computers.Count -eq 0) {
+        Write-Host "  [*] Creating common target list..." -ForegroundColor Yellow
+        
+        $commonTargets = @(
+            "DC01", "DC02", "FS01", "FS02", 
+            "SRV01", "SRV02", "EXCH01", "SQL01"
+        )
+        
+        foreach ($target in $commonTargets) {
             $computers += @{
-                Name = $result.Properties["name"][0]
-                DNSHostName = $computerName
-                OperatingSystem = $os
-                IsServer = $os -like "*Server*"
+                Name = $target
+                DNSHostName = "$target.$DomainName".ToLower()
+                Type = "Common Target"
             }
         }
         
-        Write-Host "  [+] Found $($computers.Count) computers in domain $domainName" -ForegroundColor Green
-        
-        return @{
-            DomainName = $domainName
-            DomainDN = $domainDN
-            Computers = $computers
-        }
-        
-    } catch {
-        Write-Host "  [!] Failed to get computers from $DCName : $_" -ForegroundColor Red
-        return $null
+        Write-Host "  [+] Created $($computers.Count) common targets" -ForegroundColor Yellow
     }
+    
+    return $computers
 }
 
-function Test-ComputerAccess {
-    param([string]$Computer, [string]$Domain)
+# ==================== SIMPLE SHARE TEST ====================
+function Test-ShareAccess {
+    param([string]$Computer, [string]$Share)
     
-    # Try multiple methods to test if computer is accessible
+    $sharePath = "\\$Computer\$Share"
     
-    # Method 1: Ping
     try {
-        $ping = Test-Connection -ComputerName $Computer -Count 1 -Quiet -ErrorAction Stop
-        if ($ping) { return $true }
-    } catch { }
-    
-    # Method 2: Try with domain suffix
-    if (-not $Computer.Contains(".")) {
-        try {
-            $fqdn = "$Computer.$Domain"
-            $ping = Test-Connection -ComputerName $fqdn -Count 1 -Quiet -ErrorAction Stop
-            if ($ping) { 
-                return $true, $fqdn
-            }
-        } catch { }
+        # Try to list one item
+        $test = Get-ChildItem -Path $sharePath -ErrorAction Stop 2>$null
+        return $true
+    } catch {
+        return $false
     }
-    
-    # Method 3: Try short name
-    $shortName = $Computer.Split('.')[0]
-    if ($shortName -ne $Computer) {
-        try {
-            $ping = Test-Connection -ComputerName $shortName -Count 1 -Quiet -ErrorAction Stop
-            if ($ping) { 
-                return $true, $shortName
-            }
-        } catch { }
-    }
-    
-    return $false, $Computer
 }
 
-function Scan-ComputerForShares {
-    param([string]$Computer, [string]$ResolvedName, [switch]$Quick)
+function Test-CommonShares {
+    param([string]$Computer)
     
-    Write-Host "    [*] Scanning $ResolvedName..." -ForegroundColor Gray
+    Write-Host "    [*] Testing $Computer..." -ForegroundColor Gray
     
     $results = @{
         Computer = $Computer
-        ResolvedName = $ResolvedName
-        Online = $true
-        AccessibleShares = @()
-        ScanTime = Get-Date
-        Error = $null
+        Online = $false
+        Shares = @()
+        TestTime = Get-Date
     }
     
-    # Define shares to test
-    $sharesToTest = @(
+    # First, test if computer is online
+    try {
+        $ping = Test-Connection -ComputerName $Computer -Count 1 -Quiet -ErrorAction Stop
+        if (-not $ping) {
+            Write-Host "      [-] Offline" -ForegroundColor DarkGray
+            return $results
+        }
+        
+        $results.Online = $true
+    } catch {
+        Write-Host "      [-] Cannot reach" -ForegroundColor DarkGray
+        return $results
+    }
+    
+    # Test common shares
+    $commonShares = @(
         "C$", "ADMIN$", "IPC$", 
-        "NETLOGON", "SYSVOL", 
+        "NETLOGON", "SYSVOL",
         "Users", "Public", "Share",
-        "Data", "Files", "Backup",
-        "IT", "Finance", "HR"
+        "Data", "Files", "Backup"
     )
     
-    $testedCount = 0
-    $accessibleCount = 0
-    
-    foreach ($share in $sharesToTest) {
-        $sharePath = "\\$ResolvedName\$share"
-        $testedCount++
+    foreach ($share in $commonShares) {
+        $accessible = Test-ShareAccess -Computer $Computer -Share $share
         
-        try {
-            # Try to access the share
-            $test = Get-ChildItem -Path $sharePath -ErrorAction Stop 2>$null
-            
-            Write-Host "      [+] ACCESSIBLE: $sharePath" -ForegroundColor Green
+        if ($accessible) {
+            Write-Host "      [+] $share" -ForegroundColor Green
             
             $shareInfo = @{
                 Name = $share
-                Path = $sharePath
+                Path = "\\$Computer\$share"
                 Type = if ($share -match '\$$') { "Admin" } else { "Regular" }
-                Accessible = $true
             }
             
-            # Try to get some file info if not quick scan
-            if (-not $Quick) {
-                try {
-                    $files = Get-ChildItem -Path $sharePath -ErrorAction Stop | Select-Object -First 5
-                    $shareInfo.SampleFiles = @($files | ForEach-Object { $_.Name })
-                    $shareInfo.FileCount = (Get-ChildItem -Path $sharePath -ErrorAction SilentlyContinue | Measure-Object).Count
-                } catch {
-                    $shareInfo.SampleFiles = @()
-                    $shareInfo.FileCount = 0
-                }
+            # Try to get some basic info
+            try {
+                $items = Get-ChildItem -Path "\\$Computer\$share" -ErrorAction Stop | Select-Object -First 3
+                $shareInfo.SampleFiles = @($items | ForEach-Object { $_.Name })
+            } catch {
+                $shareInfo.SampleFiles = @()
             }
             
-            $results.AccessibleShares += $shareInfo
-            $accessibleCount++
-            
-            # In quick mode, stop after first admin share or 2 regular shares
-            if ($Quick -and $accessibleCount -ge 2) {
-                break
-            }
-            
-        } catch {
-            # Share not accessible or doesn't exist
-            continue
+            $results.Shares += $shareInfo
         }
     }
     
-    $results.TotalSharesTested = $testedCount
-    $results.AccessibleShareCount = $accessibleCount
+    if ($results.Shares.Count -gt 0) {
+        Write-Host "      [+] Found $($results.Shares.Count) accessible shares" -ForegroundColor Green
+    } else {
+        Write-Host "      [-] No accessible shares" -ForegroundColor DarkYellow
+    }
     
     return $results
 }
 
-function Find-InterestingFilesInShare {
-    param([string]$SharePath, [int]$MaxDepth = 1)
-    
-    $interestingFiles = @()
-    $interestingPatterns = @(
-        "*.txt", "*.xml", "*.config", "*.ini", 
-        "*.bat", "*.ps1", "*.vbs", "*.cmd",
-        "*.sql", "*.mdb", "*.accdb",
-        "*.xls*", "*.doc*", "*.pdf",
-        "pass*.txt", "cred*.txt", "backup*", 
-        "secret*", "*.pwd", "*.kdbx"
-    )
-    
-    try {
-        foreach ($pattern in $interestingPatterns) {
-            try {
-                $files = Get-ChildItem -Path $SharePath -Filter $pattern -Recurse -Depth $MaxDepth -ErrorAction SilentlyContinue | Select-Object -First 10
-                
-                foreach ($file in $files) {
-                    $interestingFiles += @{
-                        Name = $file.Name
-                        Path = $file.FullName
-                        Size = "{0:N2} KB" -f ($file.Length / 1KB)
-                        LastWrite = $file.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
-                        Extension = $file.Extension
-                    }
-                }
-            } catch { }
-        }
-    } catch { }
-    
-    return $interestingFiles
-}
-
 # ==================== MAIN EXECUTION ====================
 try {
-    Write-Host "[*] Starting Targeted Domain Share Scanner" -ForegroundColor Green
-    Write-Host "[*] Target Domain Controller: $DomainController" -ForegroundColor White
-    Write-Host "[*] Max Computers to Scan: $MaxComputers" -ForegroundColor Gray
+    Write-Host "[*] Starting Simple Share Scanner" -ForegroundColor Green
+    Write-Host "[*] Target: $DomainController" -ForegroundColor White
+    Write-Host "[*] UseNetBIOS: $UseNetBIOS" -ForegroundColor Gray
     
-    # Step 1: Get computers from the specified domain controller
-    $domainData = Get-TargetedComputers -DCName $DomainController
+    # Step 1: Test connection
+    $connection = Test-SimpleConnection -DCName $DomainController
     
-    if (-not $domainData) {
-        Write-Host "[!] Failed to get computers from $DomainController" -ForegroundColor Red
-        Write-Host "[*] Trying alternative methods..." -ForegroundColor Yellow
+    if (-not $connection.Success) {
+        Write-Host "`n[!] WARNING: Could not verify domain connection" -ForegroundColor Red
+        Write-Host "[*] You may not have access to this domain" -ForegroundColor Yellow
+        Write-Host "[*] Or the domain controller may be unreachable" -ForegroundColor Yellow
         
-        # Fallback: Try to get domain from DC name
-        if ($DomainController -match '\.') {
-            $domainName = $DomainController.Substring($DomainController.IndexOf('.') + 1).ToUpper()
-            Write-Host "[*] Inferred domain: $domainName" -ForegroundColor Yellow
-            
-            # Try net view for this domain
-            try {
-                $netOutput = net view /domain:$domainName 2>$null
-                $computers = $netOutput | Where-Object { $_ -match '\\\\' } | ForEach-Object { 
-                    @{ Name = ($_.Trim() -replace '\\\\', ''); DNSHostName = ($_.Trim() -replace '\\\\', ''); OperatingSystem = "Unknown"; IsServer = $false }
-                }
-                
-                if ($computers.Count -gt 0) {
-                    $domainData = @{
-                        DomainName = $domainName
-                        DomainDN = ""
-                        Computers = $computers
-                    }
-                    Write-Host "[+] Found $($computers.Count) computers via net view" -ForegroundColor Green
-                }
-            } catch {
-                Write-Host "[!] Net view also failed" -ForegroundColor Red
-                exit 1
-            }
-        }
-        
-        if (-not $domainData) {
+        $continue = Read-Host "Continue anyway? (y/n)"
+        if ($continue -notmatch '^y') {
             exit 1
         }
+        
+        # Create basic domain info
+        $connection.DomainInfo = @{
+            DomainName = "UNKNOWN"
+            DomainDN = ""
+            ServerName = $DomainController
+        }
     }
     
-    # Step 2: Filter and limit computers
-    $allComputers = $domainData.Computers
-    Write-Host "[*] Total computers in domain: $($allComputers.Count)" -ForegroundColor White
-    
-    # Prioritize servers and DCs
-    $servers = $allComputers | Where-Object { $_.IsServer -or $_.Name -like "*DC*" -or $_.Name -like "*SRV*" }
-    $workstations = $allComputers | Where-Object { -not $_.IsServer }
-    
-    # Select computers to scan
-    $computersToScan = @()
-    if ($servers.Count -gt 0) {
-        $computersToScan += $servers | Select-Object -First ($MaxComputers / 2)
-    }
-    if ($workstations.Count -gt 0) {
-        $computersToScan += $workstations | Select-Object -First ($MaxComputers / 2)
+    if ($TestOnly) {
+        Write-Host "`n[+] Test completed. Use without -TestOnly to scan for shares." -ForegroundColor Green
+        exit 0
     }
     
-    if ($computersToScan.Count -eq 0) {
-        $computersToScan = $allComputers | Select-Object -First $MaxComputers
+    # Step 2: Discover computers
+    $computers = Get-ComputersSimple -DCName $DomainController `
+        -DomainName $connection.DomainInfo.DomainName `
+        -UseNetBIOSMode:$UseNetBIOS
+    
+    if ($computers.Count -eq 0) {
+        Write-Host "[!] No computers found to scan" -ForegroundColor Red
+        exit 1
     }
     
-    Write-Host "[*] Selected $($computersToScan.Count) computers for scanning" -ForegroundColor Green
-    Write-Host "    - Servers: $(($computersToScan | Where-Object { $_.IsServer }).Count)" -ForegroundColor Gray
-    Write-Host "    - Workstations: $(($computersToScan | Where-Object { -not $_.IsServer }).Count)" -ForegroundColor Gray
+    Write-Host "`n[*] Found $($computers.Count) computers to test" -ForegroundColor Green
+    Write-Host "[*] Testing share accessibility..." -ForegroundColor Green
     
-    # Step 3: Scan for accessible shares
-    Write-Host "`n[*] Scanning for accessible shares..." -ForegroundColor Green
-    
+    # Step 3: Test shares
     $scanResults = @()
     $onlineCount = 0
-    $accessibleCount = 0
+    $shareCount = 0
     $adminShareCount = 0
     
     $i = 0
-    foreach ($computer in $computersToScan) {
+    foreach ($computer in $computers) {
         $i++
-        Write-Progress -Activity "Scanning Computers" -Status "Computer $i of $($computersToScan.Count)" -PercentComplete (($i / $computersToScan.Count) * 100)
+        $computerName = $computer.DNSHostName
         
-        Write-Host "  [$i/$($computersToScan.Count)] Testing: $($computer.Name)" -ForegroundColor Cyan
+        Write-Host "  [$i/$($computers.Count)] $computerName" -ForegroundColor Cyan
         
-        # Test if computer is accessible
-        $accessible, $resolvedName = Test-ComputerAccess -Computer $computer.DNSHostName -Domain $domainData.DomainName
-        
-        if ($accessible) {
-            $onlineCount++
-            
-            # Scan for shares
-            $result = Scan-ComputerForShares -Computer $computer.Name -ResolvedName $resolvedName -Quick:$QuickScan
-            
-            if ($result.AccessibleShareCount -gt 0) {
-                $accessibleCount++
-                
-                # Deep scan if requested
-                if ($DeepScan) {
-                    foreach ($share in $result.AccessibleShares) {
-                        if ($share.Accessible) {
-                            $interestingFiles = Find-InterestingFilesInShare -SharePath $share.Path
-                            $share.InterestingFiles = $interestingFiles
-                            $share.InterestingFileCount = $interestingFiles.Count
-                            
-                            if ($share.Type -eq "Admin") {
-                                $adminShareCount++
-                            }
-                        }
-                    }
-                }
-                
-                $scanResults += $result
-                
-                Write-Host "    [+] Found $($result.AccessibleShareCount) accessible shares" -ForegroundColor Green
-            } else {
-                Write-Host "    [-] No accessible shares found" -ForegroundColor DarkYellow
-            }
-        } else {
-            Write-Host "    [-] Offline or unreachable" -ForegroundColor DarkGray
+        # Try multiple name formats if needed
+        $testNames = @($computerName)
+        if ($computerName -match '\.') {
+            $testNames += $computerName.Split('.')[0]  # Short name
         }
+        
+        foreach ($testName in $testNames) {
+            $result = Test-CommonShares -Computer $testName
+            
+            if ($result.Online) {
+                $onlineCount++
+                
+                if ($result.Shares.Count -gt 0) {
+                    $shareCount += $result.Shares.Count
+                    $adminShareCount += ($result.Shares | Where-Object { $_.Type -eq "Admin" }).Count
+                    
+                    $scanResults += $result
+                    
+                    # Stop testing names if we found shares
+                    break
+                }
+            }
+        }
+        
+        # Progress
+        [int]$percent = ($i / $computers.Count) * 100
+        Write-Progress -Activity "Scanning Shares" -Status "$i of $($computers.Count) computers" -PercentComplete $percent
     }
     
-    Write-Progress -Activity "Scanning Computers" -Completed
+    Write-Progress -Activity "Scanning Shares" -Completed
     
     # Step 4: Compile results
-    $totalAccessibleShares = ($scanResults | ForEach-Object { $_.AccessibleShareCount } | Measure-Object -Sum).Sum
-    $totalInterestingFiles = ($scanResults | ForEach-Object { 
-        $_.AccessibleShares | ForEach-Object { $_.InterestingFileCount }
-    } | Measure-Object -Sum).Sum
-    
     $finalResults = @{
         Metadata = @{
             ScanTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            TargetDomainController = $DomainController
-            Domain = $domainData.DomainName
-            ScanType = if ($DeepScan) { "Deep" } elseif ($QuickScan) { "Quick" } else { "Standard" }
+            Target = $DomainController
+            Domain = $connection.DomainInfo.DomainName
+            TotalComputers = $computers.Count
             ScanDuration = ((Get-Date) - $startTime).ToString("hh\:mm\:ss")
-            Parameters = @{
-                MaxComputers = $MaxComputers
-                QuickScan = $QuickScan
-                DeepScan = $DeepScan
-            }
         }
-        DomainInfo = $domainData
+        ConnectionInfo = $connection
+        Computers = $computers
         ScanResults = $scanResults
-        Statistics = @{
-            TotalComputersFound = $allComputers.Count
-            ComputersScanned = $computersToScan.Count
-            ComputersOnline = $onlineCount
-            ComputersWithAccessibleShares = $accessibleCount
-            TotalAccessibleShares = $totalAccessibleShares
-            AdminSharesAccessible = $adminShareCount
-            InterestingFilesFound = $totalInterestingFiles
-        }
-        SecurityFindings = @()
-    }
-    
-    # Step 5: Identify security findings
-    if ($adminShareCount -gt 0) {
-        $finalResults.SecurityFindings += @{
-            Severity = "CRITICAL"
-            Type = "AdminShareAccess"
-            Description = "$adminShareCount admin shares are accessible"
-            Details = $scanResults | ForEach-Object {
-                $_.AccessibleShares | Where-Object { $_.Type -eq "Admin" } | ForEach-Object {
-                    "$($_.Path)"
-                }
-            }
+        Summary = @{
+            OnlineComputers = $onlineCount
+            ComputersWithShares = $scanResults.Count
+            TotalSharesFound = $shareCount
+            AdminSharesFound = $adminShareCount
         }
     }
     
-    if ($accessibleCount -gt 0) {
-        $finalResults.SecurityFindings += @{
-            Severity = "HIGH"
-            Type = "ShareAccess"
-            Description = "Access to $accessibleCount computers with $totalAccessibleShares shares"
-        }
-    }
-    
-    # Step 6: Save results
+    # Step 5: Save results
     Write-Host "`n[*] Saving results to: $OutputPath" -ForegroundColor Green
-    
     $finalResults | ConvertTo-Json -Depth 10 | Out-File -FilePath $OutputPath -Encoding UTF8
     
-    # Step 7: Create summary report
-    $summaryPath = $OutputPath -replace "\.json$", "_summary.txt"
+    # Step 6: Display summary
+    Write-Host "`n" + ("=" * 60) -ForegroundColor Cyan
+    Write-Host " SCAN COMPLETE" -ForegroundColor Green
+    Write-Host "=" * 60 -ForegroundColor Cyan
     
-    $summary = @"
-TARGETED DOMAIN SHARE SCAN - SUMMARY REPORT
-===============================================================
-Scan Time: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-Target Domain Controller: $DomainController
-Domain: $($domainData.DomainName)
-Scan Duration: $($finalResults.Metadata.ScanDuration)
-
-SCAN PARAMETERS:
-  Max Computers: $MaxComputers
-  Quick Scan: $QuickScan
-  Deep Scan: $DeepScan
-
-RESULTS SUMMARY:
-  Total computers in domain: $($allComputers.Count)
-  Computers scanned: $($computersToScan.Count)
-  Computers online: $onlineCount
-  Computers with accessible shares: $accessibleCount
-  Total accessible shares: $totalAccessibleShares
-  Admin shares accessible: $adminShareCount
-  Interesting files found: $totalInterestingFiles
-
-SECURITY FINDINGS:
-$(
-    if ($finalResults.SecurityFindings.Count -gt 0) {
-        foreach ($finding in $finalResults.SecurityFindings) {
-            "  [$($finding.Severity)] $($finding.Description)"
-            if ($finding.Details) {
-                foreach ($detail in $finding.Details) {
-                    "      - $detail"
-                }
-            }
-        }
-    } else {
-        "  No significant security findings."
-    }
-)
-
-ACCESSIBLE SHARES FOUND:
-$(
-    if ($totalAccessibleShares -gt 0) {
-        $shareCount = 0
-        foreach ($result in $scanResults) {
-            foreach ($share in $result.AccessibleShares) {
-                $shareCount++
-                "  $shareCount. $($share.Path)"
-                if ($share.InterestingFileCount -gt 0) {
-                    "      Interesting files: $($share.InterestingFileCount)"
-                }
-            }
-        }
-    } else {
-        "  No accessible shares found."
-    }
-)
-
-RECOMMENDATIONS:
-1. Review and secure admin shares (C$, ADMIN$)
-2. Implement share permissions and access controls
-3. Remove unnecessary shares
-4. Monitor share access logs
-5. Educate users about file sharing security
-
-NOTES:
-- This scan targeted domain controller: $DomainController
-- Results are specific to domain: $($domainData.DomainName)
-- Complete data saved to: $OutputPath
-- Use findings for authorized security improvements only
-"@
-    
-    $summary | Out-File -FilePath $summaryPath -Encoding UTF8
-    
-    # Step 8: Display final summary
-    Write-Host "`n" + ("=" * 70) -ForegroundColor Cyan
-    Write-Host " TARGETED SHARE SCAN COMPLETE" -ForegroundColor Green
-    Write-Host "=" * 70 -ForegroundColor Cyan
-    
-    Write-Host "Domain: $($domainData.DomainName)" -ForegroundColor White
-    Write-Host "Domain Controller: $DomainController" -ForegroundColor White
+    Write-Host "Target Domain: $($connection.DomainInfo.DomainName)" -ForegroundColor White
     Write-Host "Scan Duration: $($finalResults.Metadata.ScanDuration)" -ForegroundColor White
     
-    Write-Host "`nSCAN RESULTS:" -ForegroundColor Yellow
-    Write-Host "  Computers online: $onlineCount/$($computersToScan.Count)" -ForegroundColor White
-    Write-Host "  Computers with shares: $accessibleCount" -ForegroundColor $(if($accessibleCount -gt 0){"Green"}else{"White"})
-    Write-Host "  Total shares found: $totalAccessibleShares" -ForegroundColor $(if($totalAccessibleShares -gt 0){"Green"}else{"White"})
-    Write-Host "  Admin shares: $adminShareCount" -ForegroundColor $(if($adminShareCount -gt 0){"Red"}else{"Green"})
-    Write-Host "  Interesting files: $totalInterestingFiles" -ForegroundColor $(if($totalInterestingFiles -gt 0){"Yellow"}else{"White"})
+    Write-Host "`nRESULTS:" -ForegroundColor Yellow
+    Write-Host "  Computers tested: $($computers.Count)" -ForegroundColor White
+    Write-Host "  Computers online: $onlineCount" -ForegroundColor White
+    Write-Host "  Computers with shares: $($scanResults.Count)" -ForegroundColor $(if($scanResults.Count -gt 0){'Green'}else{'White'})
+    Write-Host "  Total shares found: $shareCount" -ForegroundColor $(if($shareCount -gt 0){'Green'}else{'White'})
+    Write-Host "  Admin shares (C$, ADMIN$): $adminShareCount" -ForegroundColor $(if($adminShareCount -gt 0){'Red'}else{'Green'})
     
-    if ($adminShareCount -gt 0) {
-        Write-Host "`n[!] CRITICAL SECURITY ISSUE!" -ForegroundColor Red
-        Write-Host "    Admin shares are accessible without proper restrictions!" -ForegroundColor Red
-        Write-Host "    This allows potential lateral movement and data exposure." -ForegroundColor Red
+    # Show accessible shares
+    if ($shareCount -gt 0) {
+        Write-Host "`nACCESSIBLE SHARES:" -ForegroundColor Green
+        foreach ($result in $scanResults) {
+            foreach ($share in $result.Shares) {
+                Write-Host "  - $($share.Path)" -ForegroundColor $(if($share.Type -eq 'Admin'){'Red'}else{'White'})
+            }
+        }
     }
     
-    Write-Host "`nOUTPUT FILES:" -ForegroundColor Green
-    Write-Host "  Complete Data: $OutputPath" -ForegroundColor White
-    Write-Host "  Summary Report: $summaryPath" -ForegroundColor White
+    # Security warnings
+    if ($adminShareCount -gt 0) {
+        Write-Host "`n[!] SECURITY WARNING!" -ForegroundColor Red
+        Write-Host "    Admin shares are accessible. This is a critical security issue!" -ForegroundColor Red
+    }
     
-    Write-Host "`n[+] Share scanning completed successfully!" -ForegroundColor Green
+    Write-Host "`nOutput saved to: $OutputPath" -ForegroundColor Green
     
-}
-catch {
+} catch {
     Write-Host "`n[!] ERROR: $_" -ForegroundColor Red
-    Write-Host "[!] Error details: $($_.Exception.Message)" -ForegroundColor DarkRed
-    Write-Host "[!] Stack trace: $($_.Exception.StackTrace)" -ForegroundColor DarkRed
+    Write-Host "[!] Error occurred at line: $($_.InvocationInfo.ScriptLineNumber)" -ForegroundColor DarkRed
 }
