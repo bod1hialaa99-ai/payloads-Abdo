@@ -10,7 +10,7 @@ param(
     [switch]$TestOnly,
     
     [Parameter(Mandatory=$false)]
-    [switch]$Verbose,
+    [switch]$ShowDetails,
     
     [Parameter(Mandatory=$false)]
     [pscredential]$Credential
@@ -252,12 +252,12 @@ function Invoke-SmartEnumeration {
                     $groupInfo.Members = $members
                 }
             } else {
-                if ($Verbose) {
+                if ($ShowDetails) {
                     Write-Host "  [-] $($group.Name) - Not found" -ForegroundColor Gray
                 }
             }
         } catch {
-            if ($Verbose) {
+            if ($ShowDetails) {
                 Write-Host "  [!] Error enumerating $($group.Name): $_" -ForegroundColor DarkYellow
             }
         }
