@@ -47,7 +47,7 @@ function Load-ADModule {
             return $true
         }
         catch {
-            Write-Warning "[!] Failed to load from custom path: $_"
+            Write-Warning ("[!] Failed to load from custom path: {0}" -f $_)
         }
     }
     
@@ -72,7 +72,7 @@ function Load-ADModule {
                 return $true
             }
             catch {
-                Write-Warning "[!] Failed to load from $path : $_"
+                Write-Warning ("[!] Failed to load from $path : {0}" -f $_)
                 continue
             }
         }
@@ -163,7 +163,7 @@ function Get-ADDomain {
         }
     }
     catch {
-        Write-Error "[!] Could not create AD module wrapper: $_"
+        Write-Error ("[!] Could not create AD module wrapper: {0}" -f $_)
     }
     
     Write-Error "[!] ActiveDirectory module could not be loaded. Please provide path to Microsoft.ActiveDirectory.Management.dll using -ADModulePath parameter"
@@ -189,7 +189,7 @@ function ConvertTo-BloodhoundTime {
 function Get-SidString {
     param([byte[]]$SidBytes)
     try {
-        $sid = [System.Security.Principal.SecurityIdentifier]::new($SidBytes, 0)
+        $sid = New-Object System.Security.Principal.SecurityIdentifier($SidBytes, 0)
         return $sid.Value
     }
     catch {
@@ -220,7 +220,7 @@ function Get-DomainSid {
         }
     }
     catch {
-        Write-Warning "Failed to get domain SID for $Domain: $_"
+        Write-Warning ("Failed to get domain SID for {0}: {1}" -f $Domain, $_)
     }
     return $null
 }
@@ -280,7 +280,7 @@ function Get-DomainData {
         }
     }
     catch {
-        Write-Warning "[!] Failed to enumerate domain $Domain: $_"
+        Write-Warning ("[!] Failed to enumerate domain {0}: {1}" -f $Domain, $_)
     }
     
     return $domainData
@@ -1181,7 +1181,7 @@ function Main {
                 Write-Host "[+] Successfully connected to $domain" -ForegroundColor Green
             }
             catch {
-                Write-Warning "[!] Could not connect to $domain: $_"
+                Write-Warning ("[!] Could not connect to {0}: {1}" -f $domain, $_)
                 Write-Host "[*] Trying alternative connection methods..." -ForegroundColor Yellow
                 # Try with DC discovery
                 try {
@@ -1258,7 +1258,7 @@ function Main {
             
         }
         catch {
-            Write-Error "[!] Failed to process domain '$domain': $_"
+            Write-Error ("[!] Failed to process domain '{0}': {1}" -f $domain, $_)
             continue
         }
     }
@@ -1351,7 +1351,7 @@ try {
     Main
 }
 catch {
-    Write-Error "[!] Script execution failed: $_"
+    Write-Error ("[!] Script execution failed: {0}" -f $_)
     Write-Host "`nTroubleshooting tips:" -ForegroundColor Yellow
     Write-Host "1. Ensure you have the AD module DLLs available" -ForegroundColor White
     Write-Host "2. Use -ADModulePath parameter to specify DLL location" -ForegroundColor White
