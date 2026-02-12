@@ -1,31 +1,29 @@
 <#
 .SYNOPSIS
-    Checks if LDAP signing is required on domain controllers.
-    Accepts messy domain input, auto-corrects, and finds DCs reliably.
+    Checks if LDAP signing is required on domain controllers for a given domain.
+.DESCRIPTION
+    Uses the Active Directory module (loaded from DLL if needed) and direct LDAP binds
+    to determine whether unsigned LDAP is allowed. Accepts domain names in FQDN or DN format.
 .PARAMETER Domain
-    Domain name in any format: FQDN, DN, NetBIOS, or even with typos/spaces.
-.PARAMETER DomainController
-    Optional – specify a DC hostname/IP directly (bypass discovery).
+    Target domain. Can be FQDN (contoso.com) or Distinguished Name (DC=contoso,DC=com).
 .PARAMETER Credential
-    Alternate credentials for LDAP bind.
+    Optional alternate credentials for LDAP bind.
 .PARAMETER ADModulePath
-    Path to AD module DLL/PSD1 (if not installed).
+    Path to ActiveDirectory.psd1 or Microsoft.ActiveDirectory.Management.dll (if not installed).
 .PARAMETER VerboseOutput
-    Show detailed diagnostic messages.
+    Show detailed progress and diagnostic messages.
 .EXAMPLE
-    .\Test-LdapSigning.ps1 -Domain "STADC6200. R02. XLGS. LOCAL"
+    .\Test-LdapSigning.ps1 -Domain "contoso.com"
 .EXAMPLE
-    .\Test-LdapSigning.ps1 -Domain "DC=STADC6200,DC=RO2,DC=XLGS,DC=LOCAL"
+    .\Test-LdapSigning.ps1 -Domain "DC=contoso,DC=com" -VerboseOutput
 .EXAMPLE
-    .\Test-LdapSigning.ps1 -Domain "STADC6200.RO2.XLGS.LOCAL" -DomainController "dc01.STADC6200.RO2.XLGS.LOCAL"
+    .\Test-LdapSigning.ps1 -Domain "contoso.com" -ADModulePath ".\ADModule\ActiveDirectory.psd1"
 #>
 
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
     [string]$Domain,
-    
-    [string]$DomainController,
     
     [System.Management.Automation.PSCredential]$Credential,
     
@@ -34,137 +32,121 @@ param(
     [switch]$VerboseOutput
 )
 
-# ------------------------------------------------------------
-# Enhanced logging – respects -VerboseOutput
-# ------------------------------------------------------------
+# Use Write-Verbose for verbose messages, but also provide console output when -VerboseOutput is used
 function Write-Log {
     param(
         [string]$Message,
         [string]$ForegroundColor = "Gray",
         [switch]$IsVerbose
     )
+    
     if ($IsVerbose -and -not $VerboseOutput) { return }
+    
     $timeStamp = Get-Date -Format "HH:mm:ss"
     if ($VerboseOutput -or $ForegroundColor -ne "Gray") {
         Write-Host "[$timeStamp] $Message" -ForegroundColor $ForegroundColor
-    } else {
+    }
+    else {
         Write-Verbose $Message
     }
 }
 
-# ------------------------------------------------------------
-# Load AD module (DLL support)
-# ------------------------------------------------------------
 function Load-ADModule {
     param([string]$CustomPath)
-    if (Get-Module -Name ActiveDirectory) { return $true }
+    
+    Write-Log "Checking for ActiveDirectory module..." -ForegroundColor Cyan
+    
+    if (Get-Module -Name ActiveDirectory) {
+        Write-Log "ActiveDirectory module already loaded." -ForegroundColor Green
+        return $true
+    }
+    
     if ($CustomPath -and (Test-Path $CustomPath)) {
-        try { Import-Module $CustomPath -ErrorAction Stop; return $true } catch {}
+        try {
+            Write-Log "Loading from custom path: $CustomPath" -ForegroundColor Yellow
+            Import-Module $CustomPath -ErrorAction Stop
+            Write-Log "Successfully loaded ActiveDirectory module." -ForegroundColor Green
+            return $true
+        }
+        catch {
+            Write-Log "Failed to load from custom path: $_" -ForegroundColor Red
+        }
     }
-    try { Import-Module ActiveDirectory -ErrorAction Stop; return $true } catch {}
-    return $false
+    
+    # Try default system locations
+    try {
+        Import-Module ActiveDirectory -ErrorAction Stop
+        Write-Log "Loaded ActiveDirectory module from system." -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Log "ActiveDirectory module not available. Will use DNS + LDAP fallback." -ForegroundColor Yellow
+        return $false
+    }
 }
 
-# ------------------------------------------------------------
-# INTELLIGENT DOMAIN NORMALIZATION
-# Fixes spaces, "02" -> "RO2", removes stray dots, etc.
-# ------------------------------------------------------------
-function Normalize-DomainName {
-    param([string]$InputString)
+function Convert-DomainDNtoFQDN {
+    param([string]$DomainInput)
     
-    # Remove all spaces
-    $clean = $InputString -replace '\s+', ''
-    
-    # If it's already a DN (contains "DC="), just clean spaces and return
-    if ($clean -match 'DC=') {
-        return $clean
+    # Already FQDN?
+    if ($DomainInput -notmatch "DC=") {
+        return $DomainInput.Trim()
     }
     
-    # Common typo: "02" should be "RO2" (likely your case)
-    if ($clean -match '\.02\.') {
-        $clean = $clean -replace '\.02\.', '.RO2.'
-        Write-Log "Corrected '02' to 'RO2' → $clean" -ForegroundColor Yellow -IsVerbose
+    # Convert "DC=contoso,DC=com" -> "contoso.com"
+    $parts = $DomainInput -split "," | ForEach-Object {
+        if ($_ -match "^DC=(.+)$") { $matches[1] }
     }
-    
-    # Ensure it's lowercase for consistency
-    $clean = $clean.ToLower()
-    
-    # Remove trailing dot if present
-    $clean = $clean.TrimEnd('.')
-    
-    # If it still doesn't look like a FQDN (has at least one dot), try to make it one
-    if ($clean -notmatch '\.') {
-        Write-Log "Domain appears to be NetBIOS name; attempting to resolve..." -ForegroundColor Yellow -IsVerbose
-        # We'll keep it as-is; later methods will try to resolve.
-    }
-    
-    return $clean
+    ($parts -join ".").ToLower()
 }
 
-# ------------------------------------------------------------
-# DOMAIN CONTROLLER DISCOVERY – 5 methods
-# ------------------------------------------------------------
-function Resolve-DomainController {
+function Get-DomainController {
     param([string]$DomainFQDN)
     
-    # Method 1: User provided a DC manually
-    if ($DomainController) {
-        Write-Log "Using manually specified DC: $DomainController" -ForegroundColor Green -IsVerbose
-        return $DomainController
-    }
+    Write-Log "Locating domain controller for $DomainFQDN..." -ForegroundColor Cyan -IsVerbose
     
-    # Method 2: AD module (Get-ADDomainController)
+    # Prefer AD module for DC discovery
     if (Get-Command Get-ADDomainController -ErrorAction SilentlyContinue) {
         try {
             $dc = Get-ADDomainController -Discover -DomainName $DomainFQDN -ErrorAction Stop
-            Write-Log "Method 2 (AD module) found: $($dc.HostName)" -ForegroundColor Green -IsVerbose
+            Write-Log "Found DC via AD module: $($dc.HostName)" -ForegroundColor Green -IsVerbose
             return $dc.HostName
-        } catch { Write-Log "Method 2 failed: $_" -ForegroundColor DarkGray -IsVerbose }
+        }
+        catch {
+            Write-Log "AD module discovery failed: $_" -ForegroundColor Yellow -IsVerbose
+        }
     }
     
-    # Method 3: DNS SRV record (_ldap._tcp.dc._msdcs.<domain>)
+    # Fallback to DNS SRV lookup
     try {
         $dc = [System.Net.Dns]::GetHostEntry("_ldap._tcp.dc._msdcs.$DomainFQDN").HostName
         if ($dc -is [array]) { $dc = $dc[0] }
-        Write-Log "Method 3 (DNS SRV) found: $dc" -ForegroundColor Green -IsVerbose
+        Write-Log "Found DC via DNS SRV: $dc" -ForegroundColor Green -IsVerbose
         return $dc
-    } catch { Write-Log "Method 3 failed: $_" -ForegroundColor DarkGray -IsVerbose }
-    
-    # Method 4: DNS A record of the domain itself (if it's a DC)
-    try {
-        $dc = [System.Net.Dns]::GetHostEntry($DomainFQDN).HostName
-        if ($dc -is [array]) { $dc = $dc[0] }
-        Write-Log "Method 4 (DNS A) found: $dc" -ForegroundColor Green -IsVerbose
-        return $dc
-    } catch { Write-Log "Method 4 failed: $_" -ForegroundColor DarkGray -IsVerbose }
-    
-    # Method 5: LDAP query for rootDSE naming context
-    try {
-        Add-Type -AssemblyName System.DirectoryServices.Protocols -ErrorAction SilentlyContinue
-        $identifier = New-Object System.DirectoryServices.Protocols.LdapDirectoryIdentifier($DomainFQDN, 389)
-        $conn = New-Object System.DirectoryServices.Protocols.LdapConnection($identifier)
-        $conn.SessionOptions.ProtocolVersion = 3
-        $conn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Anonymous
-        $conn.Timeout = [TimeSpan]::FromSeconds(5)
-        $request = New-Object System.DirectoryServices.Protocols.SearchRequest("", "(objectClass=*)", [System.DirectoryServices.Protocols.SearchScope]::Base, "defaultNamingContext")
-        $response = $conn.SendRequest($request)
-        $conn.Dispose()
-        Write-Log "Method 5 (LDAP ping) succeeded – DC is $DomainFQDN" -ForegroundColor Green -IsVerbose
-        return $DomainFQDN
-    } catch { Write-Log "Method 5 failed: $_" -ForegroundColor DarkGray -IsVerbose }
-    
-    return $null
+    }
+    catch {
+        Write-Log "DNS SRV lookup failed: $_" -ForegroundColor Red -IsVerbose
+        return $null
+    }
 }
 
-# ------------------------------------------------------------
-# LDAP SIGNING TEST (same reliable method)
-# ------------------------------------------------------------
 function Test-LdapSigning {
-    param($Server, $DomainFQDN, $Credential)
+    param(
+        [string]$Server,
+        [string]$DomainFQDN,
+        [System.Management.Automation.PSCredential]$Credential
+    )
     
     Write-Log "Testing LDAP signing requirement on $Server..." -ForegroundColor Cyan
     
-    Add-Type -AssemblyName System.DirectoryServices.Protocols -ErrorAction Stop
+    # Ensure required assembly is loaded
+    try {
+        Add-Type -AssemblyName System.DirectoryServices.Protocols -ErrorAction Stop
+    }
+    catch {
+        Write-Log "Failed to load System.DirectoryServices.Protocols: $_" -ForegroundColor Red
+        return $null
+    }
     
     $ldapCred = if ($Credential) {
         New-Object System.Net.NetworkCredential($Credential.UserName, $Credential.GetNetworkCredential().Password)
@@ -183,17 +165,18 @@ function Test-LdapSigning {
         Write-Log "Attempting LDAP bind WITHOUT signing..." -ForegroundColor Gray -IsVerbose
         $connection.Bind()
         
+        # Success → signing NOT required
         Write-Log "Bind succeeded without signing!" -ForegroundColor Green -IsVerbose
-        return $false   # signing NOT required (vulnerable)
+        return $false
     }
     catch {
         $ex = $_.Exception.InnerException -as [System.DirectoryServices.Protocols.DirectoryOperationException]
         if ($ex -and $ex.Response.ErrorMessage -match "Strong authentication required|8|00002028") {
-            Write-Log "Bind failed: STRONG AUTHENTICATION REQUIRED (signing enforced)." -ForegroundColor Red -IsVerbose
-            return $true   # signing IS required (secure)
+            Write-Log "Bind failed: STRONG AUTHENTICATION REQUIRED (signing is enforced)." -ForegroundColor Red -IsVerbose
+            return $true
         }
         else {
-            Write-Log "Unexpected error: $_" -ForegroundColor Red
+            Write-Log "Unexpected error during bind: $_" -ForegroundColor Red
             return $null
         }
     }
@@ -202,41 +185,34 @@ function Test-LdapSigning {
     }
 }
 
-# ------------------------------------------------------------
-# MAIN EXECUTION
-# ------------------------------------------------------------
+# -------------------- MAIN --------------------
 Clear-Host
 Write-Host "========================================================" -ForegroundColor Green
-Write-Host "       LDAP SIGNING REQUIREMENT CHECKER v2.0" -ForegroundColor Green
+Write-Host "       LDAP SIGNING REQUIREMENT CHECKER v1.1" -ForegroundColor Green
 Write-Host "========================================================" -ForegroundColor Green
 Write-Host ""
 
-# Step 1: Normalize the domain input (remove spaces, fix typos)
+# Normalize domain
 $originalDomain = $Domain
-$normalizedDomain = Normalize-DomainName -InputString $originalDomain
-Write-Host "[Input]  : $originalDomain" -ForegroundColor White
-Write-Host "[Normalized] : $normalizedDomain" -ForegroundColor White
+$domainFQDN = Convert-DomainDNtoFQDN -DomainInput $Domain
+Write-Host "[Input] Domain specified: $originalDomain" -ForegroundColor White
+Write-Host "[Info] Normalized FQDN: $domainFQDN" -ForegroundColor White
 Write-Host ""
 
-# Step 2: Load AD module (optional – helps discovery)
+# Try to load AD module
 Load-ADModule -CustomPath $ADModulePath | Out-Null
 
-# Step 3: Find a domain controller
-$dc = Resolve-DomainController -DomainFQDN $normalizedDomain
+# Get a domain controller
+$dc = Get-DomainController -DomainFQDN $domainFQDN
 if (-not $dc) {
-    Write-Error "`n[ERROR] Cannot locate a domain controller for '$normalizedDomain'."
-    Write-Host "`nPossible fixes:" -ForegroundColor Yellow
-    Write-Host "  • Use -DomainController <DC_NAME> to specify a DC manually." -ForegroundColor Cyan
-    Write-Host "  • Check your network/DNS connectivity." -ForegroundColor Cyan
-    Write-Host "  • Verify the domain name is correct (use FQDN like 'contoso.com')." -ForegroundColor Cyan
+    Write-Error "Unable to find a domain controller for $domainFQDN"
     exit 1
 }
-Write-Host "[DC]      : $dc" -ForegroundColor Green
 
-# Step 4: Perform the LDAP signing test
-$requiresSigning = Test-LdapSigning -Server $dc -DomainFQDN $normalizedDomain -Credential $Credential
+# Perform the test
+$requiresSigning = Test-LdapSigning -Server $dc -DomainFQDN $domainFQDN -Credential $Credential
 
-# Step 5: Output results
+# Output results
 Write-Host ""
 Write-Host "========================================================" -ForegroundColor Green
 Write-Host "                         RESULTS" -ForegroundColor Green
@@ -244,7 +220,7 @@ Write-Host "========================================================" -Foregroun
 
 if ($null -ne $requiresSigning) {
     Write-Host ""
-    Write-Host "Domain               : $normalizedDomain" -ForegroundColor Cyan
+    Write-Host "Domain               : $domainFQDN" -ForegroundColor Cyan
     Write-Host "Domain Controller    : $dc" -ForegroundColor Cyan
     
     if ($requiresSigning) {
