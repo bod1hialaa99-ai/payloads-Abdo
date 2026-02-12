@@ -34,9 +34,9 @@ param(
     [switch]$VerboseOutput
 )
 
-# ----------------------------------------------------------------------
-# Logging helper (respects -VerboseOutput)
-# ----------------------------------------------------------------------
+# ------------------------------------------------------------
+# LOGGING – respects -VerboseOutput, plain ASCII only
+# ------------------------------------------------------------
 function Write-Log {
     param(
         [string]$Message,
@@ -44,17 +44,17 @@ function Write-Log {
         [switch]$IsVerbose
     )
     if ($IsVerbose -and -not $VerboseOutput) { return }
-    $ts = Get-Date -Format "HH:mm:ss"
+    $timestamp = Get-Date -Format "HH:mm:ss"
     if ($VerboseOutput -or $ForegroundColor -ne "Gray") {
-        Write-Host "[$ts] $Message" -ForegroundColor $ForegroundColor
+        Write-Host "[$timestamp] $Message" -ForegroundColor $ForegroundColor
     } else {
         Write-Verbose $Message
     }
 }
 
-# ----------------------------------------------------------------------
-# Load ActiveDirectory module (supports DLL)
-# ----------------------------------------------------------------------
+# ------------------------------------------------------------
+# LOAD AD MODULE – supports DLL path
+# ------------------------------------------------------------
 function Load-ADModule {
     param([string]$CustomPath)
 
@@ -69,8 +69,7 @@ function Load-ADModule {
             Import-Module $CustomPath -ErrorAction Stop
             Write-Log "Successfully loaded ActiveDirectory module." -ForegroundColor Green -IsVerbose
             return $true
-        }
-        catch {
+        } catch {
             Write-Log "Failed to load from custom path: $_" -ForegroundColor Red -IsVerbose
         }
     }
@@ -79,31 +78,30 @@ function Load-ADModule {
         Import-Module ActiveDirectory -ErrorAction Stop
         Write-Log "Loaded ActiveDirectory module from system." -ForegroundColor Green -IsVerbose
         return $true
-    }
-    catch {
+    } catch {
         Write-Log "ActiveDirectory module not available. Using DNS/LDAP fallback." -ForegroundColor Yellow -IsVerbose
         return $false
     }
 }
 
-# ----------------------------------------------------------------------
-# Domain name normalization – removes spaces, fixes "02" -> "RO2"
-# ----------------------------------------------------------------------
+# ------------------------------------------------------------
+# DOMAIN NORMALIZATION – removes spaces, fixes "02" -> "RO2"
+# ------------------------------------------------------------
 function Normalize-DomainName {
     param([string]$InputString)
 
     # Remove all spaces
     $clean = $InputString -replace '\s+', ''
 
-    # If it's already a DN (contains "DC="), clean and return
+    # If DN (contains "DC="), clean and return
     if ($clean -match 'DC=') {
         return $clean
     }
 
-    # Common typo: ".02." should be ".RO2."
+    # Fix common typo: .02. -> .RO2.
     if ($clean -match '\.02\.') {
         $clean = $clean -replace '\.02\.', '.RO2.'
-        Write-Log "Corrected '02' to 'RO2' → $clean" -ForegroundColor Yellow -IsVerbose
+        Write-Log "Corrected '02' to 'RO2' -> $clean" -ForegroundColor Yellow -IsVerbose
     }
 
     # Lowercase, trim trailing dot
@@ -112,9 +110,9 @@ function Normalize-DomainName {
     return $clean
 }
 
-# ----------------------------------------------------------------------
-# Domain Controller discovery – 5 methods, with fallbacks
-# ----------------------------------------------------------------------
+# ------------------------------------------------------------
+# DOMAIN CONTROLLER DISCOVERY – 5 methods, full error handling
+# ------------------------------------------------------------
 function Resolve-DomainController {
     param([string]$DomainFQDN)
 
@@ -130,8 +128,7 @@ function Resolve-DomainController {
             $dc = Get-ADDomainController -Discover -DomainName $DomainFQDN -ErrorAction Stop
             Write-Log "Method 2 (AD module) found: $($dc.HostName)" -ForegroundColor Green -IsVerbose
             return $dc.HostName
-        }
-        catch {
+        } catch {
             Write-Log "Method 2 failed: $_" -ForegroundColor DarkGray -IsVerbose
         }
     }
@@ -142,8 +139,7 @@ function Resolve-DomainController {
         if ($dc -is [array]) { $dc = $dc[0] }
         Write-Log "Method 3 (DNS SRV) found: $dc" -ForegroundColor Green -IsVerbose
         return $dc
-    }
-    catch {
+    } catch {
         Write-Log "Method 3 failed: $_" -ForegroundColor DarkGray -IsVerbose
     }
 
@@ -153,8 +149,7 @@ function Resolve-DomainController {
         if ($dc -is [array]) { $dc = $dc[0] }
         Write-Log "Method 4 (DNS A) found: $dc" -ForegroundColor Green -IsVerbose
         return $dc
-    }
-    catch {
+    } catch {
         Write-Log "Method 4 failed: $_" -ForegroundColor DarkGray -IsVerbose
     }
 
@@ -171,17 +166,16 @@ function Resolve-DomainController {
         $conn.Dispose()
         Write-Log "Method 5 (LDAP ping) succeeded – DC is $DomainFQDN" -ForegroundColor Green -IsVerbose
         return $DomainFQDN
-    }
-    catch {
+    } catch {
         Write-Log "Method 5 failed: $_" -ForegroundColor DarkGray -IsVerbose
     }
 
     return $null
 }
 
-# ----------------------------------------------------------------------
-# Core LDAP signing test – uses System.DirectoryServices.Protocols
-# ----------------------------------------------------------------------
+# ------------------------------------------------------------
+# CORE LDAP SIGNING TEST – one-line regex, no pipeline issues
+# ------------------------------------------------------------
 function Test-LdapSigning {
     param(
         [string]$Server,
@@ -191,11 +185,10 @@ function Test-LdapSigning {
 
     Write-Log "Testing LDAP signing requirement on $Server..." -ForegroundColor Cyan
 
-    # Ensure the required assembly is loaded
+    # Load required assembly
     try {
         Add-Type -AssemblyName System.DirectoryServices.Protocols -ErrorAction Stop
-    }
-    catch {
+    } catch {
         Write-Log "Failed to load System.DirectoryServices.Protocols: $_" -ForegroundColor Red
         return $null
     }
@@ -221,43 +214,38 @@ function Test-LdapSigning {
         # Bind succeeded → signing NOT required
         Write-Log "Bind succeeded without signing!" -ForegroundColor Green -IsVerbose
         return $false
-    }
-    catch {
-        # Examine the inner exception
+    } catch {
         $ex = $_.Exception.InnerException -as [System.DirectoryServices.Protocols.DirectoryOperationException]
+        # ONE LINE regex – no line breaks, no pipeline confusion
         if ($ex -and $ex.Response.ErrorMessage -match "Strong authentication required|8|00002028") {
             Write-Log "Bind failed: STRONG AUTHENTICATION REQUIRED (signing enforced)." -ForegroundColor Red -IsVerbose
-            return $true   # signing IS required
-        }
-        else {
+            return $true
+        } else {
             Write-Log "Unexpected error during bind: $_" -ForegroundColor Red
             return $null
         }
-    }
-    finally {
-        if ($connection) {
-            $connection.Dispose()
-        }
+    } finally {
+        if ($connection) { $connection.Dispose() }
     }
 }
 
-# ----------------------------------------------------------------------
-# MAIN SCRIPT
-# ----------------------------------------------------------------------
+# ------------------------------------------------------------
+# MAIN SCRIPT – pure ASCII, no stray characters
+# ------------------------------------------------------------
 Clear-Host
 Write-Host "========================================================" -ForegroundColor Green
-Write-Host "       LDAP SIGNING REQUIREMENT CHECKER v2.1" -ForegroundColor Green
+Write-Host "       LDAP SIGNING REQUIREMENT CHECKER v3.0" -ForegroundColor Green
 Write-Host "========================================================" -ForegroundColor Green
 Write-Host ""
 
-# 1. Normalize the domain name
+# 1. Normalize domain
 $originalDomain = $Domain
 $normalizedDomain = Normalize-DomainName -InputString $originalDomain
 Write-Host "[Input]      : $originalDomain" -ForegroundColor White
 Write-Host "[Normalized] : $normalizedDomain" -ForegroundColor White
 Write-Host ""
 
-# 2. Load AD module (if possible)
+# 2. Load AD module (optional)
 Load-ADModule -CustomPath $ADModulePath | Out-Null
 
 # 3. Find a domain controller
@@ -265,9 +253,9 @@ $dc = Resolve-DomainController -DomainFQDN $normalizedDomain
 if (-not $dc) {
     Write-Error "`n[ERROR] Cannot locate a domain controller for '$normalizedDomain'."
     Write-Host "`nPossible fixes:" -ForegroundColor Yellow
-    Write-Host "  • Use -DomainController <DC_NAME> to specify a DC manually." -ForegroundColor Cyan
-    Write-Host "  • Check network/DNS connectivity." -ForegroundColor Cyan
-    Write-Host "  • Verify the domain name is correct (e.g., contoso.com)." -ForegroundColor Cyan
+    Write-Host "  * Use -DomainController <DC_NAME> to specify a DC manually." -ForegroundColor Cyan
+    Write-Host "  * Check network/DNS connectivity." -ForegroundColor Cyan
+    Write-Host "  * Verify the domain name is correct (e.g., contoso.com)." -ForegroundColor Cyan
     exit 1
 }
 Write-Host "[DC]         : $dc" -ForegroundColor Green
@@ -290,15 +278,13 @@ if ($null -ne $requiresSigning) {
         Write-Host "LDAP Signing Required: YES" -ForegroundColor Green
         Write-Host "Status               : SECURE - LDAP signing is enforced." -ForegroundColor Green
         Write-Host "Recommendation       : No action needed." -ForegroundColor Gray
-    }
-    else {
+    } else {
         Write-Host "LDAP Signing Required: NO" -ForegroundColor Red
         Write-Host "Status               : VULNERABLE - LDAP signing is NOT required." -ForegroundColor Red
         Write-Host "Risk                 : Susceptible to LDAP man-in-the-middle attacks." -ForegroundColor Red
         Write-Host "Recommendation       : Enable 'Domain controller: LDAP server signing requirements' policy." -ForegroundColor Yellow
     }
-}
-else {
+} else {
     Write-Host ""
     Write-Host "Test failed. Could not determine LDAP signing status." -ForegroundColor Red
     Write-Host "Check connectivity, permissions, and domain name." -ForegroundColor Yellow
