@@ -67,25 +67,22 @@ public class TestIBMi {
             System.out.println("[-] Message: " + e.getMessage());
             System.out.println("[-] Return Code: " + e.getReturnCode());
             
-            // Decode return code
-            switch (e.getReturnCode()) {
-                case AS400SecurityException.PASSWORD_NOT_CORRECT:
-                    System.out.println("[*] Reason: Password is incorrect");
-                    break;
-                case AS400SecurityException.PASSWORD_NOT_SET:
-                    System.out.println("[*] Reason: Password not set for user");
-                    break;
-                case AS400SecurityException.USERID_NOT_SET:
-                    System.out.println("[*] Reason: User ID not set");
-                    break;
-                case AS400SecurityException.USERID_NOT_VALID:
-                    System.out.println("[*] Reason: User ID is not valid");
-                    break;
-                case AS400SecurityException.USERID_DISABLED:
-                    System.out.println("[*] Reason: User ID is disabled");
-                    break;
-                default:
-                    System.out.println("[*] Reason: Unknown (return code: " + e.getReturnCode() + ")");
+            // Decode return code using correct constant names
+            int rc = e.getReturnCode();
+            if (rc == AS400SecurityException.PASSWORD_INCORRECT) {
+                System.out.println("[*] Reason: Password is incorrect");
+            } else if (rc == AS400SecurityException.PASSWORD_NOT_SET) {
+                System.out.println("[*] Reason: Password not set for user");
+            } else if (rc == AS400SecurityException.USERID_NOT_SET) {
+                System.out.println("[*] Reason: User ID not set");
+            } else if (rc == AS400SecurityException.USERID_UNKNOWN) {
+                System.out.println("[*] Reason: User ID is not valid/unknown");
+            } else if (rc == AS400SecurityException.USERID_DISABLE) {
+                System.out.println("[*] Reason: User ID is disabled");
+            } else if (rc == AS400SecurityException.PASSWORD_EXPIRED) {
+                System.out.println("[*] Reason: Password has expired");
+            } else {
+                System.out.println("[*] Reason: Unknown (return code: " + rc + ")");
             }
             
         } catch (Exception e) {
