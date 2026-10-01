@@ -76,16 +76,34 @@ Get-PowerBIDatasource -WorkspaceId <WS> -DatasetId <DS> | fl
 Export-PowerBIReport -Id <RID> -WorkspaceId <WS> -OutFile test.pbix
 ```
 
-**RLS test (needs a real table name from the report's field list):**
+**Data-exposure / RLS test — run in this exact order:**
+
+0) Set the target once, then define the helper (do this once per PowerShell window):
 ```powershell
-$g="<WS>";$d="<DS>";$t="TableName"
-$q=@{queries=@(@{query="EVALUATE ROW(`"n`", COUNTROWS('$t'))"})}|ConvertTo-Json -Depth 5
-Invoke-PowerBIRestMethod -Method Post -Url "groups/$g/datasets/$d/executeQueries" -Body $q
-$q=@{queries=@(@{query="EVALUATE ROW(`"n`", COUNTROWS('$t'))"});impersonatedUserName="other.user@tenant.com"}|ConvertTo-Json -Depth 5
-Invoke-PowerBIRestMethod -Method Post -Url "groups/$g/datasets/$d/executeQueries" -Body $q
+$g="<WS>";$d="<DS>"
+function dax($q){Invoke-PowerBIRestMethod -Method Post -Url "groups/$g/datasets/$d/executeQueries" -Body ('{"queries":[{"query":"'+$q+'"}]}')}
 ```
-- First count = your visibility. Second = as another user (403 with an error is also a result — note the text).
-- Count >> what the report shows you = RLS is filtering you (good) — then the finding hunt is role over-provisioning: `pbi "groups/<WS>/users"` and see who holds Admin/Member/Contributor (those roles **bypass RLS by design**).
+1) Discover the REAL table names — never guess:
+```powershell
+dax "EVALUATE INFO.VIEW.TABLES()"
+```
+(engine too old → `dax "EVALUATE INFO.TABLES()"`; both fail → read table names from the report's field list in the browser)
+2) Count + sample a real table (this is the data-read proof — screenshot it):
+```powershell
+dax "EVALUATE COUNTROWS(Sales)"
+dax "EVALUATE TOPN(5, Sales)"
+```
+Table name with spaces → single quotes work as-is: `dax "EVALUATE COUNTROWS('Sales Data')"`
+3) Impersonate another user (one-off command, put their UPN in):
+```powershell
+Invoke-PowerBIRestMethod -Method Post -Url "groups/$g/datasets/$d/executeQueries" -Body '{"queries":[{"query":"EVALUATE COUNTROWS(Sales)"}],"impersonatedUserName":"other.user@tenant.com"}'
+```
+
+**How to read the results:**
+- Reaching step 2 at all (even a table-not-found error) = you have Write-level access → **RLS is not applied to you** on this dataset.
+- Your count >> what the report's visuals show you = you are seeing beyond the report filters (proof of full-model read).
+- Own count == impersonated count = dataset likely has **no RLS at all** → every Viewer sees everything (finding).
+- `pbi "groups/<WS>/users" | ft displayName,groupUserAccessRight` → the Viewers listed there are the impacted users for the report; the Admins/Members/Contributors are your over-provisioning candidates.
 
 ## STEP 4 — send back
 
