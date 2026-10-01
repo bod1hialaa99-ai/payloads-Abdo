@@ -1,145 +1,108 @@
-# Power BI Pentest — Simple Runbook (module edition)
+# Power BI Pentest — Simple Runbook (fixed, v3)
 
-> Everything below runs in a normal PowerShell window on your work PC.
-> Token redaction rule: never paste full tokens back — `eyJ…<SNIP>`.
-> [ROE] = ask client approval first (the action creates an artifact/notification).
+> Run everything in ONE PowerShell window (the session lives in the window).
+> Commands kept short for hand-typing. Redact tokens as `eyJ…<SNIP>` when reporting.
+> [ROE] = get client approval first (creates an artifact/notification).
 
 ---
 
-## STEP 1 — Install & login (once, ~2 min)
+## STEP 0 — always first
 
 ```powershell
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-Install-Module MicrosoftPowerBIMgmt -Scope CurrentUser -Force
+cd $env:USERPROFILE\Desktop
 Connect-PowerBIServiceAccount
 ```
 
-- Sign-in popup = your normal work account (AD/Entra SSO). No tokens to copy.
-- If popups are blocked: `Connect-PowerBIServiceAccount -LoginType DeviceCode`
-- If `Install-Module` is blocked by policy → use the **Fallback** at the bottom.
-- Token expired / weird errors later → re-run `Connect-PowerBIServiceAccount`.
+(Only re-run Connect if you open a new window or start getting auth errors.)
 
-## STEP 2 — The one helper to remember
+## STEP 1 — the helper (FIXED: needs -Method Get)
 
 ```powershell
-function pbi($u){ try { (Invoke-PowerBIRestMethod -Url $u | ConvertFrom-Json).value } catch { $null } }
+function pbi($u){try{(Invoke-PowerBIRestMethod -Method Get -Url $u|ConvertFrom-Json).value}catch{}}
 ```
 
-Now every Power BI API is just `pbi <url>`. That's the whole runbook.
-
-## STEP 3 — The tests (run top to bottom, note results)
-
-**T1 — Workspaces you can see**
-```powershell
-pbi groups | Format-Table id, name, type, state
-```
-
-**T2 — Who has what role (per workspace — over-provisioning evidence)**
-```powershell
-pbi "groups/<ws-id>/users" | Format-Table displayName, groupUserAccessRight
-```
-
-**T3 — ONE BLOCK: dump everything to CSV (workspaces, users, datasets, datasources, gateways)**
-```powershell
-$all = pbi groups
-$all | Select id,name,type | Export-Csv ws.csv -NoTypeInformation
-Remove-Item datasources.csv -ErrorAction SilentlyContinue
-foreach ($w in $all) {
-  "== $($w.name)"
-  foreach ($d in (pbi "groups/$($w.id)/datasets")) {
-    $s = pbi "groups/$($w.id)/datasets/$($d.id)/datasources"
-    [pscustomobject]@{
-      workspace=$w.name; dataset=$d.name; datasetId=$d.id
-      srcType  = ($s.datasourceType -join ',')
-      server   = ($s.connectionDetails.server -join ',')
-      database = ($s.connectionDetails.database -join ',')
-      creds    = ($s.credentialType -join ',')
-      sso      = ($s.singleSignOnType -join ',')
-      gateway  = ($s.gatewayId -join ',')
-    } | Export-Csv datasources.csv -Append -NoTypeInformation
-  }
-}
-Import-Csv datasources.csv | Format-Table          # <-- internal server names live here
-```
-
-**T4 — Gateways + stored credentials**
-```powershell
-pbi gateways | Format-List
-pbi "gateways/<gw-id>/datasources" | Format-List datasourceType, connectionDetails, credentialType, singleSignOnType
-```
-Signal: `credentialType = Basic` → creds stored; only decryptable on the gateway host → escalation path.
-
-**T5 — Admin probe (are you accidentally tenant-wide?)**
-```powershell
-Get-PowerBIWorkspace -Scope Organization -First 10 | Format-Table Name, Type
-```
-Non-admin should get an error. If a normal account **gets a table** → Critical finding.
-
-**T6 — RLS test: row counts as you, then as someone else**
-```powershell
-$gid='<ws-guid>'; $did='<dataset-guid>'
-$q = @{queries=@(@{query='EVALUATE ROW("n", COUNTROWS(''TableName''))'})} | ConvertTo-Json -Depth 5
-Invoke-PowerBIRestMethod -Method Post -Url "groups/$gid/datasets/$did/executeQueries" -Body $q
-# as another user (the RLS bypass test):
-$q2 = @{queries=@(@{query='EVALUATE ROW("n", COUNTROWS(''TableName''))'}); impersonatedUserName='other.user@tenant.com'} | ConvertTo-Json -Depth 5
-Invoke-PowerBIRestMethod -Method Post -Url "groups/$gid/datasets/$did/executeQueries" -Body $q2
-```
-Compare the two numbers vs what the report shows you. (403 = also record it; the error text is intel.)
-
-**T7 — .pbix download as low-priv user (gets FULL model, not the filtered view)**
-```powershell
-Export-PowerBIReport -Id <report-guid> -WorkspaceId <ws-guid> -OutFile .\stolen.pbix
-```
-Then open `stolen.pbix` in Power BI Desktop → every table is readable. Strongest common finding.
-
-**T8 — Everything else via the same helper** (reports, dashboards, imports, apps, dataflows)
-```powershell
-pbi reports      | Format-Table id, name, datasetId, webUrl
-pbi dashboards   | Format-Table id, name, webUrl
-pbi imports      | Format-Table id, name, created  # .pbix uploads incl. by others in My Workspace area
-pbi apps         | Format-Table id, name
-pbi "groups/<ws-id>/dataflows" | Format-Table id, name
-```
-
-## STEP 4 — Browser checks (no PowerShell)
-
-1. **RLS baseline:** open a sensitive report → note visible rows → visual `⋯` → *Export data* → note row count.
-2. **Edit as Viewer:** append `/edit` to a report URL → Viewer must land in read-only; editor = misconfig.
-3. **Share dialog:** click *Share* → record options. "Anyone with the link" or "People in org" offered to a low-priv user = finding (don't send).
-4. **[ROE] Publish-to-web:** report → File → Embed report → *Website or portal*. Public `view?r=` link = Critical-class exposure → screenshot → **delete immediately**.
-5. **Partial RLS:** with Build permission → *Create new report* on the dataset → drag fields from **every** table → tables with no RLS role render fully.
-
-## STEP 5 — Local quick sweep (optional, 2 min)
+## STEP 2 — enumeration (short lines)
 
 ```powershell
-Get-ChildItem "$env:USERPROFILE\Documents","$env:USERPROFILE\Desktop" -Recurse -Include *.pbix,*.pbit -ea SilentlyContinue | Select FullName,Length,LastWriteTime
-Get-Service | ? { $_.DisplayName -match 'gateway|power\s*bi' } | ft Name,DisplayName,Status
+Get-PowerBIWorkspace | ft Id,Name,Type
+pbi gateways | ft Id,Name,Type
+pbi reports | ft Id,Name,DatasetId
+pbi apps | ft Id,Name
 ```
-(Found a .pbix anywhere = open in Desktop = full cached data. Autopsy commands: METHODOLOGY.md §5.2.)
 
-## STEP 6 — Paste this back (fill what you ran)
+Per workspace (replace `<WS>`):
+```powershell
+pbi "groups/<WS>/users" | ft displayName,groupUserAccessRight
+Get-PowerBIDataset -WorkspaceId <WS> | ft Id,Name
+Get-PowerBIReport  -WorkspaceId <WS> | ft Id,Name,DatasetId
+Get-PowerBIDatasource -WorkspaceId <WS> -DatasetId <DS> | fl datasourceType,connectionDetails,credentialType,singleSignOnType
+```
+
+Admin probe (a table instead of an error = Critical finding):
+```powershell
+Get-PowerBIWorkspace -Scope Organization -First 10 | ft Name
+```
+
+## STEP 3 — testing a dashboard you only have a URL for
+
+### 3a. Read the URL
+
+| URL shape | What it is | What to do |
+|---|---|---|
+| `app.powerbi.com/groups/<WS>/reports/<RID>/…` | Workspace report | You have both GUIDs — use 3b directly |
+| `app.powerbi.com/groups/me/apps/<APP>/reports/<RID>/…` | Report inside an **app** | `pbi "apps/<APP>/reports" \| fl id,name,datasetId` → get dataset GUID |
+| `app.powerbi.com/links/<code>?p=<guid>` | Share link | Open it, watch the address bar change into one of the shapes above |
+| `app.powerbi.com/view?r=eyJ…` | **Publish-to-web (anonymous, no RLS, public internet)** | That alone is a Critical-class finding — screenshot it |
+| `app.powerbi.com/groups/<WS>/rdlreports/<RID>` | Paginated report | Same tests, browser + Export |
+| `app.powerbi.com/groups/me/dashboards/<DID>` | Classic dashboard (tiles) | Open a tile → drill to underlying report, then 3b |
+
+If IDs are hidden (app/share-link), open the report in the browser → F12 → Network → Ctrl+F search
+`datasets` or `semanticModel` — the dataset GUID appears in the API calls.
+
+### 3b. Test card — run for EVERY dashboard in scope
+
+**Browser (as yourself):**
+1. Baseline: open report → note exactly which rows/regions/tenants you can see.
+2. Append `/edit` to the URL → you must land read-only as Viewer; editor = misconfig finding.
+3. Any visual → `⋯` → **Export data** → allowed? which level? how many rows?
+4. **Share** button → which link types are offered ("Anyone with the link" = finding; don't send).
+5. File → **Download report (.pbix)** → if the file downloads, open it in Power BI Desktop → every table of the model is readable (not just the filtered view you see). Strongest common finding.
+6. [ROE] File → Embed report → *Website or portal* → public link = publish-to-web enabled → screenshot → **delete the embed** immediately.
+
+**PowerShell (with `<WS>`/`<RID>` from the URL, `<DS>` from Get-PowerBIReport):**
+```powershell
+Get-PowerBIReport -WorkspaceId <WS> | ft Id,Name,DatasetId
+Get-PowerBIDatasource -WorkspaceId <WS> -DatasetId <DS> | fl
+Export-PowerBIReport -Id <RID> -WorkspaceId <WS> -OutFile test.pbix
+```
+
+**RLS test (needs a real table name from the report's field list):**
+```powershell
+$g="<WS>";$d="<DS>";$t="TableName"
+$q=@{queries=@(@{query="EVALUATE ROW(`"n`", COUNTROWS('$t'))"})}|ConvertTo-Json -Depth 5
+Invoke-PowerBIRestMethod -Method Post -Url "groups/$g/datasets/$d/executeQueries" -Body $q
+$q=@{queries=@(@{query="EVALUATE ROW(`"n`", COUNTROWS('$t'))"});impersonatedUserName="other.user@tenant.com"}|ConvertTo-Json -Depth 5
+Invoke-PowerBIRestMethod -Method Post -Url "groups/$g/datasets/$d/executeQueries" -Body $q
+```
+- First count = your visibility. Second = as another user (403 with an error is also a result — note the text).
+- Count >> what the report shows you = RLS is filtering you (good) — then the finding hunt is role over-provisioning: `pbi "groups/<WS>/users"` and see who holds Admin/Member/Contributor (those roles **bypass RLS by design**).
+
+## STEP 4 — send back
 
 ```text
-ENV:        Service? y/n | Report Server? y/n | Gateway? y/n/? | My license: ___
-LOGIN:      module worked? y/n | admin? y/n
-WORKSPACES: name | id | my role | #datasets   (one line each)
-DATASOURCES: workspace | dataset | srcType | server/database | creds | sso | gateway
-GATEWAYS:   name | id | datasource types | any Basic creds?
-T5 admin probe: error text or row count
-RLS T6:     my count = ___ | impersonated count = ___ | error = ___
-T7:         download worked? y/n | could open? y/n
-BROWSER:    1..5 results
+WORKSPACES: name | id | my role | #datasets        (from Get-PowerBIWorkspace + users call)
+GATEWAYS:   any listed? y/n | datasources: type/server/credType
+ADMIN PROBE: error text OR "returned a table"
+PER DASHBOARD: URL shape (A–F) | /edit result | export rows | share options | pbix download y/n | RLS count mine/impersonated
+ERRORS: any red error text you saw (photo/OCR is fine)
 ```
 
 ---
 
-## Fallback — no module allowed (2 lines + same T-numbers)
+## Fallback (no module): browser token + 2 lines
 
-Browser: app.powerbi.com → F12 → Network → reload → any `api.powerbi.com` request → copy the `Authorization: Bearer …` value. Then:
-
+F12 → Network → any `api.powerbi.com` request → copy Authorization header value:
 ```powershell
-$h = @{ Authorization = "Bearer <paste>" }; $base = 'https://api.powerbi.com/v1.0/myorg'
-# now replace  pbi X  with:  (irm "$base/X" -Headers $h).value    — everything else identical
+$h=@{Authorization="Bearer <paste>"};$base="https://api.powerbi.com/v1.0/myorg"
+# replace  pbi X  with:  (irm "$base/X" -Headers $h).value
 ```
-
-Token dies after ~1h → re-grab from DevTools when you get 401s.
